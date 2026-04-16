@@ -5,6 +5,8 @@ APP_DIR="/opt/upload-appointments"
 VENV_DIR="$APP_DIR/venv"
 REPO_URL="https://github.com/uon-chqi/upload-appointments.git"
 CRON_SCHEDULE="0 23 * * *"
+SERVICE_NAME="upload-appointments"
+SERVICE_USER="www-data"
 
 # When piped from curl, stdin is the script itself. Reopen stdin from the terminal.
 if ! exec < /dev/tty 2>/dev/null; then
@@ -26,13 +28,13 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # --- Install system dependencies ---
-echo "[1/7] Installing system dependencies..."
+echo "[1/9] Installing system dependencies..."
 apt-get update -qq --allow-releaseinfo-change 2>/dev/null || true
 apt-get install -y -qq python3 python3-venv python3-dev gcc pkg-config git > /dev/null
 echo "  Done."
 
 # --- Clone or pull the repo ---
-echo "[2/7] Setting up application code..."
+echo "[2/9] Setting up application code..."
 if [[ -d "$APP_DIR/.git" ]]; then
     echo "  Repository exists. Pulling latest changes..."
     git -C "$APP_DIR" pull --ff-only
@@ -43,7 +45,7 @@ fi
 echo "  Done."
 
 # --- Create virtual environment and install dependencies ---
-echo "[3/7] Setting up Python virtual environment..."
+echo "[3/9] Setting up Python virtual environment..."
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip -q
 "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" -q
@@ -54,7 +56,7 @@ ENV_FILE="$APP_DIR/.env"
 configure_env=false
 
 if [[ -f "$ENV_FILE" ]]; then
-    echo "[4/7] Existing .env file found at $ENV_FILE"
+    echo "[4/9] Existing .env file found at $ENV_FILE"
     read -rp "  Overwrite it? (y/N): " overwrite
     if [[ "$overwrite" == "y" || "$overwrite" == "Y" ]]; then
         configure_env=true
@@ -66,7 +68,7 @@ else
 fi
 
 if [[ "$configure_env" == "true" ]]; then
-    echo "[4/7] Configuring environment variables..."
+    echo "[4/9] Configuring environment variables..."
     echo
 
     read -rp "  OpenMRS DB Host [127.0.0.1]: " db_host
@@ -108,24 +110,77 @@ ENVEOF
 fi
 
 # --- Run migrations ---
-echo "[5/7] Running database migrations..."
+echo "[5/9] Running database migrations..."
 "$VENV_DIR/bin/python" "$APP_DIR/manage.py" migrate --no-input
 echo "  Done."
 
+# --- Collect static files ---
+echo "[6/9] Collecting static files..."
+"$VENV_DIR/bin/python" "$APP_DIR/manage.py" collectstatic --no-input -q
+echo "  Done."
+
 # --- Create Django superuser if needed ---
-echo "[6/7] Django admin user setup..."
+echo "[7/9] Django admin user setup..."
 SUPERUSER_EXISTS=$("$VENV_DIR/bin/python" "$APP_DIR/manage.py" shell -c \
     "from django.contrib.auth.models import User; print(User.objects.filter(is_superuser=True).exists())")
 
 if [[ "$SUPERUSER_EXISTS" == "False" ]]; then
     echo "  No admin user found. Creating one now..."
-    "$VENV_DIR/bin/python" "$APP_DIR/manage.py" createsuperuser
+    echo
+
+    read -rp "  Admin username: " admin_user
+    read -rp "  Admin email: " admin_email
+    read -rsp "  Admin password: " admin_pass
+    echo
+    read -rsp "  Confirm password: " admin_pass2
+    echo
+
+    if [[ "$admin_pass" != "$admin_pass2" ]]; then
+        echo "  Error: Passwords do not match. Skipping superuser creation."
+        echo "  You can create one later with: $VENV_DIR/bin/python $APP_DIR/manage.py createsuperuser"
+    else
+        DJANGO_SUPERUSER_PASSWORD="$admin_pass" "$VENV_DIR/bin/python" "$APP_DIR/manage.py" createsuperuser \
+            --noinput --username "$admin_user" --email "$admin_email"
+        echo "  Admin user '$admin_user' created."
+    fi
 else
     echo "  Admin user already exists. Skipping."
 fi
 
+# --- Set file ownership ---
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
+
+# --- Set up Gunicorn systemd service ---
+echo "[8/9] Setting up Gunicorn service..."
+
+read -rp "  Server port [8000]: " server_port
+server_port=${server_port:-8000}
+
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SVCEOF
+[Unit]
+Description=Upload Appointments (Gunicorn)
+After=network.target
+
+[Service]
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${VENV_DIR}/bin/gunicorn uploadappointments.wsgi:application --bind 0.0.0.0:${server_port} --workers 3 --timeout 120
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME" --quiet
+systemctl restart "$SERVICE_NAME"
+echo "  Gunicorn service started on port $server_port."
+
 # --- Set up cron job ---
-echo "[7/7] Setting up cron job (daily at 11:00 PM)..."
+echo "[9/9] Setting up cron job (daily at 11:00 PM)..."
 CRON_CMD="cd $APP_DIR && $VENV_DIR/bin/python manage.py upload_appointments >> /var/log/upload-appointments.log 2>&1"
 CRON_LINE="$CRON_SCHEDULE $CRON_CMD"
 
@@ -143,11 +198,16 @@ echo
 echo "  App location:  $APP_DIR"
 echo "  Virtual env:   $VENV_DIR"
 echo "  Config:        $ENV_FILE"
+echo "  Service:       systemctl status $SERVICE_NAME"
+echo "  Running on:    http://0.0.0.0:$server_port"
 echo "  Cron:          Daily at 11:00 PM"
 echo "  Log:           /var/log/upload-appointments.log"
 echo
-echo "  To run the dev server:"
-echo "    cd $APP_DIR && $VENV_DIR/bin/python manage.py runserver 0.0.0.0:8000"
+echo "  Useful commands:"
+echo "    sudo systemctl status $SERVICE_NAME    # Check service status"
+echo "    sudo systemctl restart $SERVICE_NAME   # Restart service"
+echo "    sudo systemctl stop $SERVICE_NAME      # Stop service"
+echo "    sudo journalctl -u $SERVICE_NAME -f    # View live logs"
 echo
 echo "  To update later:"
 echo "    sudo bash $APP_DIR/deploy.sh"
