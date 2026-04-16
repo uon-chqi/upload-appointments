@@ -8,13 +8,24 @@ CRON_SCHEDULE="0 23 * * *"
 SERVICE_NAME="upload-appointments"
 SERVICE_USER="www-data"
 
-# When piped from curl, stdin is the script itself. Reopen stdin from the terminal.
-if ! exec < /dev/tty 2>/dev/null; then
-    echo "Error: Cannot read interactive input when piped."
-    echo "Please run instead:"
-    echo "  wget -O /tmp/deploy.sh https://raw.githubusercontent.com/uon-chqi/upload-appointments/main/deploy.sh && sudo bash /tmp/deploy.sh"
-    exit 1
-fi
+# Helper: prompt the user for input (works even when script is piped)
+prompt() {
+    local var_name="$1" prompt_text="$2" default="${3:-}"
+    local input
+    echo -n "$prompt_text" > /dev/tty
+    read -r input < /dev/tty
+    input="${input:-$default}"
+    eval "$var_name=\$input"
+}
+
+prompt_silent() {
+    local var_name="$1" prompt_text="$2"
+    local input
+    echo -n "$prompt_text" > /dev/tty
+    read -rs input < /dev/tty
+    echo > /dev/tty
+    eval "$var_name=\$input"
+}
 
 echo "=========================================="
 echo "  Upload Appointments - Deployment Script"
@@ -57,7 +68,7 @@ configure_env=false
 
 if [[ -f "$ENV_FILE" ]]; then
     echo "[4/9] Existing .env file found at $ENV_FILE"
-    read -rp "  Overwrite it? (y/N): " overwrite
+    prompt overwrite "  Overwrite it? (y/N): "
     if [[ "$overwrite" == "y" || "$overwrite" == "Y" ]]; then
         configure_env=true
     else
@@ -71,28 +82,15 @@ if [[ "$configure_env" == "true" ]]; then
     echo "[4/9] Configuring environment variables..."
     echo
 
-    read -rp "  OpenMRS DB Host [127.0.0.1]: " db_host
-    db_host=${db_host:-127.0.0.1}
-
-    read -rp "  OpenMRS DB Port [3306]: " db_port
-    db_port=${db_port:-3306}
-
-    read -rp "  OpenMRS DB Name [openmrs]: " db_name
-    db_name=${db_name:-openmrs}
-
-    read -rp "  OpenMRS DB User [root]: " db_user
-    db_user=${db_user:-root}
-
-    read -rp "  OpenMRS DB Password: " db_password
+    prompt db_host "  OpenMRS DB Host [127.0.0.1]: " "127.0.0.1"
+    prompt db_port "  OpenMRS DB Port [3306]: " "3306"
+    prompt db_name "  OpenMRS DB Name [openmrs]: " "openmrs"
+    prompt db_user "  OpenMRS DB User [root]: " "root"
+    prompt_silent db_password "  OpenMRS DB Password: "
     echo
-
-    read -rp "  CHQI API Base URL [https://api-sms-portal.chqi.org]: " api_url
-    api_url=${api_url:-https://api-sms-portal.chqi.org}
-
-    read -rp "  CHQI API Username: " api_user
-
-    read -rp "  CHQI API Password: " api_password
-    echo
+    prompt api_url "  CHQI API Base URL [https://api-sms-portal.chqi.org]: " "https://api-sms-portal.chqi.org"
+    prompt api_user "  CHQI API Username: "
+    prompt_silent api_password "  CHQI API Password: "
 
     cat > "$ENV_FILE" <<ENVEOF
 OPENMRS_DB_NAME=${db_name}
@@ -128,12 +126,10 @@ if [[ "$SUPERUSER_EXISTS" == "False" ]]; then
     echo "  No admin user found. Creating one now..."
     echo
 
-    read -rp "  Admin username: " admin_user
-    read -rp "  Admin email: " admin_email
-    read -rsp "  Admin password: " admin_pass
-    echo
-    read -rsp "  Confirm password: " admin_pass2
-    echo
+    prompt admin_user "  Admin username: "
+    prompt admin_email "  Admin email: "
+    prompt_silent admin_pass "  Admin password: "
+    prompt_silent admin_pass2 "  Confirm password: "
 
     if [[ "$admin_pass" != "$admin_pass2" ]]; then
         echo "  Error: Passwords do not match. Skipping superuser creation."
@@ -153,8 +149,7 @@ chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
 # --- Set up Gunicorn systemd service ---
 echo "[8/9] Setting up Gunicorn service..."
 
-read -rp "  Server port [8000]: " server_port
-server_port=${server_port:-8000}
+prompt server_port "  Server port [8000]: " "8000"
 
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SVCEOF
 [Unit]
