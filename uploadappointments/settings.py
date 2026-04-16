@@ -85,11 +85,11 @@ DATABASES = {
     },
     'openmrs': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('OPENMRS_DB_NAME', 'openmrs'),
-        'USER': os.environ.get('OPENMRS_DB_USER', 'root'),
+        'NAME': os.environ.get('OPENMRS_DB_NAME', ''),
+        'USER': os.environ.get('OPENMRS_DB_USER', ''),
         'PASSWORD': os.environ.get('OPENMRS_DB_PASSWORD', ''),
-        'HOST': os.environ.get('OPENMRS_DB_HOST', '127.0.0.1'),
-        'PORT': os.environ.get('OPENMRS_DB_PORT', '3306'),
+        'HOST': os.environ.get('OPENMRS_DB_HOST', ''),
+        'PORT': os.environ.get('OPENMRS_DB_PORT', ''),
         'OPTIONS': {
             'read_default_file': '',
             'charset': 'utf8mb4',
