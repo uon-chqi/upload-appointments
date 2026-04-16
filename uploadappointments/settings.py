@@ -142,9 +142,9 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # API Configuration
-CHQI_API_BASE_URL = os.environ.get('CHQI_API_BASE_URL', 'https://api-sms-portal.chqi.org')
-CHQI_API_USERNAME = os.environ.get('CHQI_API_USERNAME', 'superadmin')
-CHQI_API_PASSWORD = os.environ.get('CHQI_API_PASSWORD', 'CHQIAdmin@2026')
+CHQI_API_BASE_URL = os.environ.get('CHQI_API_BASE_URL', '')
+CHQI_API_USERNAME = os.environ.get('CHQI_API_USERNAME', '')
+CHQI_API_PASSWORD = os.environ.get('CHQI_API_PASSWORD', '')
 
 LOGIN_URL = '/accounts/login/'
 LOGIN_REDIRECT_URL = '/'
