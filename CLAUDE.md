@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Django 5.2 project for uploading appointments. Uses SQLite as the default database. The project is in early stages with scaffolded boilerplate.
+Django 4.2 LTS project for uploading appointments (pinned for Python 3.8 / Ubuntu 20.04 compatibility). Uses SQLite as the default database. The project is in early stages with scaffolded boilerplate.
 
 ## Project Structure
 
