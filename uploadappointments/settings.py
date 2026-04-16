@@ -10,10 +10,15 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -37,6 +42,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'upload',
 ]
 
 MIDDLEWARE = [
@@ -76,8 +82,22 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
-    }
+    },
+    'openmrs': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': os.environ.get('OPENMRS_DB_NAME', 'openmrs'),
+        'USER': os.environ.get('OPENMRS_DB_USER', 'root'),
+        'PASSWORD': os.environ.get('OPENMRS_DB_PASSWORD', ''),
+        'HOST': os.environ.get('OPENMRS_DB_HOST', '127.0.0.1'),
+        'PORT': os.environ.get('OPENMRS_DB_PORT', '3306'),
+        'OPTIONS': {
+            'read_default_file': '',
+            'charset': 'utf8mb4',
+        },
+    },
 }
+
+DATABASE_ROUTERS = ['upload.db_router.OpenmrsRouter']
 
 
 # Password validation
@@ -104,7 +124,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Africa/Nairobi'
 
 USE_I18N = True
 
@@ -120,3 +140,12 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# API Configuration
+CHQI_API_BASE_URL = os.environ.get('CHQI_API_BASE_URL', 'https://api-sms-portal.chqi.org')
+CHQI_API_USERNAME = os.environ.get('CHQI_API_USERNAME', 'superadmin')
+CHQI_API_PASSWORD = os.environ.get('CHQI_API_PASSWORD', 'CHQIAdmin@2026')
+
+LOGIN_URL = '/accounts/login/'
+LOGIN_REDIRECT_URL = '/'
+LOGOUT_REDIRECT_URL = '/accounts/login/'
