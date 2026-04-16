@@ -6,6 +6,9 @@ VENV_DIR="$APP_DIR/venv"
 REPO_URL="https://github.com/uon-chqi/upload-appointments.git"
 CRON_SCHEDULE="0 23 * * *"
 
+# When piped from curl, stdin is the script itself. Reopen stdin from the terminal.
+exec < /dev/tty
+
 echo "=========================================="
 echo "  Upload Appointments - Deployment Script"
 echo "=========================================="
@@ -43,19 +46,21 @@ echo "  Done."
 
 # --- Collect .env configuration ---
 ENV_FILE="$APP_DIR/.env"
+configure_env=false
+
 if [[ -f "$ENV_FILE" ]]; then
     echo "[4/7] Existing .env file found at $ENV_FILE"
     read -rp "  Overwrite it? (y/N): " overwrite
-    if [[ "$overwrite" != "y" && "$overwrite" != "Y" ]]; then
-        echo "  Keeping existing .env file."
-    else
+    if [[ "$overwrite" == "y" || "$overwrite" == "Y" ]]; then
         configure_env=true
+    else
+        echo "  Keeping existing .env file."
     fi
 else
     configure_env=true
 fi
 
-if [[ "${configure_env:-false}" == "true" ]]; then
+if [[ "$configure_env" == "true" ]]; then
     echo "[4/7] Configuring environment variables..."
     echo
 
@@ -71,9 +76,7 @@ if [[ "${configure_env:-false}" == "true" ]]; then
     read -rp "  OpenMRS DB User [root]: " db_user
     db_user=${db_user:-root}
 
-    read -rsp "  OpenMRS DB Password: " db_password
-    echo
-
+    read -rp "  OpenMRS DB Password: " db_password
     echo
 
     read -rp "  CHQI API Base URL [https://api-sms-portal.chqi.org]: " api_url
@@ -81,21 +84,18 @@ if [[ "${configure_env:-false}" == "true" ]]; then
 
     read -rp "  CHQI API Username: " api_user
 
-    read -rsp "  CHQI API Password: " api_password
+    read -rp "  CHQI API Password: " api_password
     echo
 
     cat > "$ENV_FILE" <<ENVEOF
-# OpenMRS MySQL Database
-OPENMRS_DB_NAME=$db_name
-OPENMRS_DB_USER=$db_user
-OPENMRS_DB_PASSWORD=$db_password
-OPENMRS_DB_HOST=$db_host
-OPENMRS_DB_PORT=$db_port
-
-# CHQI API
-CHQI_API_BASE_URL=$api_url
-CHQI_API_USERNAME=$api_user
-CHQI_API_PASSWORD=$api_password
+OPENMRS_DB_NAME=${db_name}
+OPENMRS_DB_USER=${db_user}
+OPENMRS_DB_PASSWORD=${db_password}
+OPENMRS_DB_HOST=${db_host}
+OPENMRS_DB_PORT=${db_port}
+CHQI_API_BASE_URL=${api_url}
+CHQI_API_USERNAME=${api_user}
+CHQI_API_PASSWORD=${api_password}
 ENVEOF
 
     chmod 600 "$ENV_FILE"
