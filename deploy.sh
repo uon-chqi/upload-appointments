@@ -21,7 +21,7 @@ fi
 echo "[1/7] Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-dev gcc pkg-config \
-    default-libmysqlclient-dev git > /dev/null
+    libmysqlclient-dev git > /dev/null
 echo "  Done."
 
 # --- Clone or pull the repo ---
