@@ -103,7 +103,7 @@ CHQI_API_USERNAME=${api_user}
 CHQI_API_PASSWORD=${api_password}
 ENVEOF
 
-    chmod 600 "$ENV_FILE"
+    chmod 644 "$ENV_FILE"
     echo "  .env saved."
 fi
 
