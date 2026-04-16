@@ -86,7 +86,8 @@ SELECT
     MAX(a.marital_status) AS marital_status,
     MAX(a.case_manager_assigned) AS case_manager_assigned,
     MAX(a.facility_mfl) AS facility_mfl,
-    MAX(a.facility_name) AS facility_name
+    MAX(a.facility_name) AS facility_name,
+    MAX(a.consented) AS consented
 FROM (
     SELECT DISTINCT
         a.patient_id,
@@ -127,7 +128,10 @@ FROM (
         (SELECT x.value_reference FROM openmrs.location_attribute x
          WHERE x.location_id = a.location_id) AS facility_mfl,
         (SELECT x.name FROM openmrs.location x
-         WHERE x.location_id = a.location_id) AS facility_name
+         WHERE x.location_id = a.location_id) AS facility_name,
+        (SELECT CASE WHEN x.value_coded = 1065 THEN 'Yes' ELSE 'No' END AS response
+         FROM obs x WHERE x.concept_id = 166607 AND x.person_id = a.patient_id
+         ORDER BY obs_datetime DESC LIMIT 1) AS consented
     FROM openmrs.visit a
     INNER JOIN openmrs.person b ON a.patient_id = b.person_id
     LEFT JOIN openmrs.visit_type c ON a.visit_type_id = c.visit_type_id
@@ -138,7 +142,7 @@ FROM (
         INNER JOIN program y ON x.program_id = y.program_id
         WHERE y.name = 'HIV'
     )
-) a
+) a WHERE a.consented = 'Yes'
 GROUP BY a.patient_id, a.visit_date
 """
 
