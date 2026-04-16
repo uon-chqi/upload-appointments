@@ -86,11 +86,10 @@ if [[ "$configure_env" == "true" ]]; then
     prompt db_port "  OpenMRS DB Port [3306]: " "3306"
     prompt db_name "  OpenMRS DB Name [openmrs]: " "openmrs"
     prompt db_user "  OpenMRS DB User [root]: " "root"
-    prompt_silent db_password "  OpenMRS DB Password: "
-    echo
+    prompt db_password "  OpenMRS DB Password: "
     prompt api_url "  CHQI API Base URL [https://api-sms-portal.chqi.org]: " "https://api-sms-portal.chqi.org"
     prompt api_user "  CHQI API Username: "
-    prompt_silent api_password "  CHQI API Password: "
+    prompt api_password "  CHQI API Password: "
 
     cat > "$ENV_FILE" <<ENVEOF
 OPENMRS_DB_NAME=${db_name}
@@ -114,7 +113,7 @@ echo "  Done."
 
 # --- Collect static files ---
 echo "[6/9] Collecting static files..."
-"$VENV_DIR/bin/python" "$APP_DIR/manage.py" collectstatic --no-input -q
+"$VENV_DIR/bin/python" "$APP_DIR/manage.py" collectstatic --noinput -v 0
 echo "  Done."
 
 # --- Create Django superuser if needed ---
@@ -128,8 +127,8 @@ if [[ "$SUPERUSER_EXISTS" == "False" ]]; then
 
     prompt admin_user "  Admin username: "
     prompt admin_email "  Admin email: "
-    prompt_silent admin_pass "  Admin password: "
-    prompt_silent admin_pass2 "  Confirm password: "
+    prompt admin_pass "  Admin password: "
+    prompt admin_pass2 "  Confirm password: "
 
     if [[ "$admin_pass" != "$admin_pass2" ]]; then
         echo "  Error: Passwords do not match. Skipping superuser creation."
