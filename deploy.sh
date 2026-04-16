@@ -7,7 +7,12 @@ REPO_URL="https://github.com/uon-chqi/upload-appointments.git"
 CRON_SCHEDULE="0 23 * * *"
 
 # When piped from curl, stdin is the script itself. Reopen stdin from the terminal.
-exec < /dev/tty
+if ! exec < /dev/tty 2>/dev/null; then
+    echo "Error: Cannot read interactive input when piped."
+    echo "Please run instead:"
+    echo "  wget -O /tmp/deploy.sh https://raw.githubusercontent.com/uon-chqi/upload-appointments/main/deploy.sh && sudo bash /tmp/deploy.sh"
+    exit 1
+fi
 
 echo "=========================================="
 echo "  Upload Appointments - Deployment Script"
