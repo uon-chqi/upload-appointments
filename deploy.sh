@@ -144,8 +144,8 @@ fi
 
 # --- Set file ownership ---
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
-chmod 775 "$APP_DIR"
-chmod 664 "$APP_DIR/db.sqlite3"
+chmod 777 "$APP_DIR"
+chmod 666 "$APP_DIR/db.sqlite3"
 
 # --- Set up Gunicorn systemd service ---
 echo "[8/9] Setting up Gunicorn service..."
