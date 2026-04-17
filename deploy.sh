@@ -144,6 +144,8 @@ fi
 
 # --- Set file ownership ---
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
+chmod 775 "$APP_DIR"
+chmod 664 "$APP_DIR/db.sqlite3"
 
 # --- Set up Gunicorn systemd service ---
 echo "[8/9] Setting up Gunicorn service..."
@@ -181,6 +183,7 @@ CRON_LINE="$CRON_SCHEDULE $CRON_CMD"
 # Remove any existing cron entry for this app, then add the new one
 (crontab -l 2>/dev/null | grep -v "upload_appointments" || true; echo "$CRON_LINE") | crontab -
 touch /var/log/upload-appointments.log
+chmod 666 /var/log/upload-appointments.log
 echo "  Cron job installed: $CRON_SCHEDULE"
 echo "  Log file: /var/log/upload-appointments.log"
 
