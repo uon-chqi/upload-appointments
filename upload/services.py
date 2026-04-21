@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import traceback
 
 import requests
@@ -229,21 +230,30 @@ def get_api_token():
             f"(username={'set' if username else 'MISSING'}, "
             f"password={'set' if password else 'MISSING'})"
         )
-    response = requests.post(
-        url,
-        data=json.dumps({
-            'username': username,
-            'password': password,
-        }),
-        headers={'Content-Type': 'application/json'},
-        timeout=30,
-    )
-    if not response.ok:
+    max_retries = 3
+    retry_delay = 10  # seconds
+    for attempt in range(1, max_retries + 1):
+        response = requests.post(
+            url,
+            data=json.dumps({
+                'username': username,
+                'password': password,
+            }),
+            headers={'Content-Type': 'application/json'},
+            timeout=30,
+        )
+        if response.ok:
+            break
         try:
             detail = response.json()
         except Exception:
             detail = response.text
-        logger.error("Login failed (HTTP %s): %s", response.status_code, detail)
+        logger.error("Login attempt %d/%d failed (HTTP %s): %s",
+                      attempt, max_retries, response.status_code, detail)
+        # Retry on server errors (5xx), not client errors (4xx)
+        if response.status_code >= 500 and attempt < max_retries:
+            time.sleep(retry_delay * attempt)
+            continue
         response.raise_for_status()
     data = response.json()
     logger.info("Login response keys: %s", list(data.keys()) if isinstance(data, dict) else data)
