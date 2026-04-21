@@ -158,38 +158,62 @@ def fetch_appointments(date_from, date_to):
         columns = [col[0] for col in cursor.description]
         rows = cursor.fetchall()
 
+    def safe_str(value, default=''):
+        """Convert a value to string, returning default for None/empty."""
+        if value is None:
+            return default
+        return str(value).strip() or default
+
+    def safe_int(value, default=0):
+        """Convert a value to int, returning default on failure."""
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
+    def safe_float(value, default=0.0):
+        """Convert a value to float, returning default on failure."""
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
     patients = []
     for row in rows:
         record = dict(zip(columns, row))
         patients.append({
-            'patient_id': str(record.get('patient_id') or ''),
-            'patient_name': str(record.get('patient_name') or ''),
-            'gender': str(record.get('gender') or ''),
-            'dob': str(record.get('dob') or ''),
-            'age': int(record.get('age') or 0),
-            'ccc_number': str(record.get('ccc_number') or ''),
-            'phone_number': str(record.get('phone_number') or ''),
+            'patient_id': safe_str(record.get('patient_id')),
+            'patient_name': safe_str(record.get('patient_name')),
+            'gender': safe_str(record.get('gender')),
+            'dob': safe_str(record.get('dob')),
+            'age': safe_int(record.get('age')),
+            'ccc_number': safe_str(record.get('ccc_number')),
+            'phone_number': safe_str(record.get('phone_number')),
             'email': '',
-            'physical_address': str(record.get('city_village') or ''),
-            'enrollment_date': str(record.get('visit_date') or ''),
-            'county': str(record.get('county') or ''),
-            'sub_county': str(record.get('sub_county') or ''),
-            'ward': str(record.get('ward') or ''),
-            'city_village': str(record.get('city_village') or ''),
-            'landmark': str(record.get('landmark') or ''),
-            'address5': str(record.get('address5') or ''),
-            'address6': str(record.get('address6') or ''),
-            'marital_status': str(record.get('marital_status') or ''),
-            'facility_mfl': str(record.get('facility_mfl') or ''),
-            'facility_name': str(record.get('facility_name') or ''),
-            'risk_classification': str(record.get('risk_classification') or 'Unknown'),
-            'risk_classification_value': float(record.get('risk_classification_value') or 0),
-            'risk_factors': str(record.get('risk_factors') or ''),
-            'last_viral_load': str(record.get('last_viral_load') or ''),
-            'appointment_status': str(record.get('appointment_status') or 'Pending'),
-            'appointment_date': str(record.get('appointment_date') or ''),
-            'visit_date': str(record.get('visit_date') or ''),
-            'case_manager_assigned': str(record.get('case_manager_assigned') or ''),
+            'physical_address': safe_str(record.get('city_village')),
+            'enrollment_date': safe_str(record.get('visit_date')),
+            'county': safe_str(record.get('county')),
+            'sub_county': safe_str(record.get('sub_county')),
+            'ward': safe_str(record.get('ward')),
+            'city_village': safe_str(record.get('city_village')),
+            'landmark': safe_str(record.get('landmark')),
+            'address5': safe_str(record.get('address5')),
+            'address6': safe_str(record.get('address6')),
+            'marital_status': safe_str(record.get('marital_status')),
+            'facility_mfl': safe_str(record.get('facility_mfl')),
+            'facility_name': safe_str(record.get('facility_name')),
+            'risk_classification': safe_str(record.get('risk_classification'), 'Unknown'),
+            'risk_classification_value': safe_float(record.get('risk_classification_value')),
+            'risk_factors': safe_str(record.get('risk_factors')),
+            'last_viral_load': safe_str(record.get('last_viral_load')),
+            'appointment_status': safe_str(record.get('appointment_status'), 'Pending'),
+            'appointment_date': safe_str(record.get('appointment_date')),
+            'visit_date': safe_str(record.get('visit_date')),
+            'case_manager_assigned': safe_str(record.get('case_manager_assigned')),
         })
     return patients
 
