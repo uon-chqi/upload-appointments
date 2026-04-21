@@ -257,7 +257,7 @@ def upload_patients(patients, token):
             'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
         },
-        timeout=120,
+        timeout=1000,
     )
     if not response.ok:
         try:
