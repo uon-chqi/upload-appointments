@@ -3,6 +3,8 @@ from django.db import models
 
 class UploadLog(models.Model):
     STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('in_progress', 'In Progress'),
         ('success', 'Success'),
         ('failed', 'Failed'),
     ]
@@ -18,8 +20,10 @@ class UploadLog(models.Model):
         'auth.User', null=True, blank=True, on_delete=models.SET_NULL,
         help_text='User who triggered a manual upload',
     )
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES)
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES)
     records_uploaded = models.IntegerField(default=0)
+    batches_total = models.IntegerField(default=0)
+    batches_completed = models.IntegerField(default=0)
     error_message = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
 

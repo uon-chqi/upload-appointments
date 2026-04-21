@@ -22,6 +22,7 @@
         .btn { padding: 10px 24px; border: none; border-radius: 4px; font-size: 14px; font-weight: 600; cursor: pointer; }
         .btn-primary { background: #3498db; color: #fff; }
         .btn-primary:hover { background: #2980b9; }
+        .btn-primary:disabled { background: #a0c4e8; cursor: not-allowed; opacity: 0.7; }
 
         .alert { padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }
         .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
@@ -37,6 +38,7 @@
         .badge { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; }
         .badge-success { background: #d4edda; color: #155724; }
         .badge-failed { background: #f8d7da; color: #721c24; }
+        .badge-pending, .badge-in_progress { background: #fff3cd; color: #856404; }
         .badge-cron { background: #e2e3f1; color: #383d6e; }
         .badge-manual { background: #fff3cd; color: #856404; }
 
@@ -45,6 +47,13 @@
         .empty { text-align: center; padding: 40px; color: #999; }
         .nav { margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
         .nav a { color: #3498db; text-decoration: none; font-size: 14px; }
+
+        .progress-container { display: none; margin-top: 16px; }
+        .progress-bar-wrapper { background: #e9ecef; border-radius: 8px; overflow: hidden; height: 24px; }
+        .progress-bar { height: 100%; background: #3498db; border-radius: 8px; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 600; min-width: 40px; }
+        .progress-status { margin-top: 8px; font-size: 13px; color: #666; }
+        .progress-status.status-success { color: #155724; font-weight: 600; }
+        .progress-status.status-failed { color: #721c24; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -89,8 +98,14 @@
                         {% endif %}
                     </div>
                 </div>
-                <button type="submit" class="btn btn-primary">Upload Now</button>
+                <button type="submit" class="btn btn-primary" id="upload-btn">Upload Now</button>
             </form>
+            <div class="progress-container" id="progress-container">
+                <div class="progress-bar-wrapper">
+                    <div class="progress-bar" id="progress-bar" style="width: 0%">0%</div>
+                </div>
+                <div class="progress-status" id="progress-status">Starting upload...</div>
+            </div>
         </div>
 
         <div class="card">
@@ -119,7 +134,7 @@
                             </td>
                             <td>{{ log.triggered_by_user|default:"—" }}</td>
                             <td>
-                                <span class="badge {% if log.status == 'success' %}badge-success{% else %}badge-failed{% endif %}">
+                                <span class="badge badge-{{ log.status }}">
                                     {{ log.get_status_display }}
                                 </span>
                             </td>
@@ -141,5 +156,93 @@
             {% endif %}
         </div>
     </div>
+
+    <script>
+    (function() {
+        const form = document.querySelector('form[method="post"]');
+        const btn = document.getElementById('upload-btn');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const progressStatus = document.getElementById('progress-status');
+
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+
+            btn.disabled = true;
+            btn.textContent = 'Uploading...';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+            progressStatus.textContent = 'Starting upload...';
+            progressStatus.className = 'progress-status';
+
+            const formData = new FormData(form);
+
+            fetch(form.action || window.location.href, {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+            })
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (data.log_id) {
+                    pollProgress(data.log_id);
+                }
+            })
+            .catch(function(err) {
+                progressStatus.textContent = 'Error starting upload: ' + err;
+                progressStatus.className = 'progress-status status-failed';
+                btn.disabled = false;
+                btn.textContent = 'Upload Now';
+            });
+        });
+
+        function pollProgress(logId) {
+            const url = '{% url "upload:upload_progress" log_id=0 %}'.replace('/0/', '/' + logId + '/');
+            const interval = setInterval(function() {
+                fetch(url)
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    if (data.status === 'pending') {
+                        progressStatus.textContent = 'Querying appointments...';
+                        return;
+                    }
+
+                    if (data.batches_total > 0) {
+                        const pct = Math.round((data.batches_completed / data.batches_total) * 100);
+                        progressBar.style.width = pct + '%';
+                        progressBar.textContent = pct + '%';
+                        progressStatus.textContent = 'Uploading batch ' + data.batches_completed + ' of ' + data.batches_total +
+                            ' (' + data.records_uploaded + ' records)';
+                    } else if (data.status === 'in_progress') {
+                        progressStatus.textContent = 'Fetching records...';
+                    }
+
+                    if (data.status === 'success') {
+                        clearInterval(interval);
+                        progressBar.style.width = '100%';
+                        progressBar.textContent = '100%';
+                        progressBar.style.background = '#28a745';
+                        progressStatus.textContent = 'Upload complete — ' + data.records_uploaded + ' records uploaded.';
+                        progressStatus.className = 'progress-status status-success';
+                        btn.disabled = false;
+                        btn.textContent = 'Upload Now';
+                        setTimeout(function() { location.reload(); }, 2000);
+                    } else if (data.status === 'failed') {
+                        clearInterval(interval);
+                        progressBar.style.background = '#dc3545';
+                        progressStatus.textContent = 'Upload failed: ' + data.error_message;
+                        progressStatus.className = 'progress-status status-failed';
+                        btn.disabled = false;
+                        btn.textContent = 'Upload Now';
+                    }
+                })
+                .catch(function() {});
+            }, 1500);
+        }
+    })();
+    </script>
 </body>
 </html>

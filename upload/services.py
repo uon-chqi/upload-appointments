@@ -271,64 +271,86 @@ def get_api_token():
     return token
 
 
-def upload_patients(patients, token):
-    """POST patient data to the CHQI API."""
+def upload_patients(patients, token, log=None, batch_size=10):
+    """POST patient data to the CHQI API in batches."""
+    import math
     url = f"{settings.CHQI_API_BASE_URL}/api/patients/upload-json"
-    response = requests.post(
-        url,
-        data=json.dumps({'patients': patients}),
-        headers={
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json',
-        },
-        timeout=1000,
-    )
-    if not response.ok:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        raise requests.HTTPError(
-            f"HTTP {response.status_code}: {detail}",
-            response=response,
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+    total_batches = math.ceil(len(patients) / batch_size)
+    if log:
+        log.batches_total = total_batches
+        log.batches_completed = 0
+        log.save(update_fields=['batches_total', 'batches_completed'])
+
+    results = []
+    for i in range(0, len(patients), batch_size):
+        batch = patients[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        logger.info("Uploading batch %d/%d (%d–%d of %d patients)",
+                     batch_num, total_batches, i + 1, i + len(batch), len(patients))
+        response = requests.post(
+            url,
+            data=json.dumps({'patients': batch}),
+            headers=headers,
+            timeout=1000,
         )
-    return response.json()
+        if not response.ok:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
+            raise requests.HTTPError(
+                f"HTTP {response.status_code}: {detail}",
+                response=response,
+            )
+        results.append(response.json())
+        if log:
+            log.batches_completed = batch_num
+            log.save(update_fields=['batches_completed'])
+    return results
 
 
-def run_upload(date_from, date_to, triggered_by='manual', user=None):
+def run_upload(date_from, date_to, triggered_by='manual', user=None, log=None):
     """Full pipeline: query OpenMRS, authenticate, upload, and log the result."""
     from .models import UploadLog
 
-    log = UploadLog(
-        date_from=date_from,
-        date_to=date_to,
-        triggered_by=triggered_by,
-        triggered_by_user=user,
-        status='failed',
-    )
+    if log is None:
+        log = UploadLog(
+            date_from=date_from,
+            date_to=date_to,
+            triggered_by=triggered_by,
+            triggered_by_user=user,
+        )
+    log.status = 'in_progress'
+    log.save()
 
     try:
         patients = fetch_appointments(date_from, date_to)
         log.records_uploaded = len(patients)
+        log.save(update_fields=['records_uploaded'])
 
         if not patients:
             log.status = 'success'
             log.error_message = 'No records found for the given period.'
-            log.save()
+            log.save(update_fields=['status', 'error_message'])
             return log
 
         token = get_api_token()
-        upload_patients(patients, token)
+        upload_patients(patients, token, log=log)
 
         log.status = 'success'
-        log.save()
+        log.save(update_fields=['status'])
         logger.info(
             "Upload successful: %d records for %s to %s",
             len(patients), date_from, date_to,
         )
     except Exception:
         log.error_message = traceback.format_exc()
-        log.save()
+        log.status = 'failed'
+        log.save(update_fields=['status', 'error_message'])
         logger.error(
             "Upload failed for %s to %s: %s",
             date_from, date_to, log.error_message,
