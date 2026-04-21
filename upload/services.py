@@ -221,16 +221,30 @@ def fetch_appointments(date_from, date_to):
 def get_api_token():
     """Authenticate with the CHQI API and return a bearer token."""
     url = f"{settings.CHQI_API_BASE_URL}/api/auth/login"
+    username = settings.CHQI_API_USERNAME
+    password = settings.CHQI_API_PASSWORD
+    if not username or not password:
+        raise ValueError(
+            f"CHQI API credentials not configured "
+            f"(username={'set' if username else 'MISSING'}, "
+            f"password={'set' if password else 'MISSING'})"
+        )
     response = requests.post(
         url,
         data=json.dumps({
-            'username': settings.CHQI_API_USERNAME,
-            'password': settings.CHQI_API_PASSWORD,
+            'username': username,
+            'password': password,
         }),
         headers={'Content-Type': 'application/json'},
         timeout=30,
     )
-    response.raise_for_status()
+    if not response.ok:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        logger.error("Login failed (HTTP %s): %s", response.status_code, detail)
+        response.raise_for_status()
     data = response.json()
     logger.info("Login response keys: %s", list(data.keys()) if isinstance(data, dict) else data)
     # Try common token field names; search nested structures too
