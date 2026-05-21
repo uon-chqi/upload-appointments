@@ -137,6 +137,9 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+
+# Plaintext shared secrets — only the encrypted secrets.env.gpg is committed
+secrets.env
 .venv
 env/
 venv/
