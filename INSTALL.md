@@ -16,7 +16,7 @@ Before you begin, make sure you have:
 - OpenMRS database credentials — a MySQL user with **read access** to the
   OpenMRS database.
 - The **secrets passphrase** for this deployment. It is shared separately by
-  the NASCOP team and is deliberately not stored in the code repository.
+  the NASCOP team.
 
 ## 1. Remove any previous installation (re-install only)
 
