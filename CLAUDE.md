@@ -44,7 +44,7 @@ python manage.py createsuperuser
 - Database: SQLite (`db.sqlite3`) for Django models, MySQL for OpenMRS (read-only)
 - The `upload` app is registered in INSTALLED_APPS
 - OpenMRS MySQL connection configured via environment variables (`OPENMRS_DB_*`)
-- CHQI API credentials configured via environment variables (`CHQI_API_*`)
+- Ushauri DIFF platform credentials configured via environment variables (`CHQI_API_*`)
 
 ## Environment Variables
 

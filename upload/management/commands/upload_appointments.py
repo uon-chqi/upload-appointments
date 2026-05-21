@@ -6,7 +6,7 @@ from upload.services import run_upload
 
 
 class Command(BaseCommand):
-    help = 'Fetch appointments from OpenMRS and upload to CHQI API'
+    help = 'Fetch appointments from OpenMRS and upload to Ushauri DIFF platform'
 
     def add_arguments(self, parser):
         parser.add_argument(

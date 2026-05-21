@@ -220,13 +220,13 @@ def fetch_appointments(date_from, date_to):
 
 
 def get_api_token():
-    """Authenticate with the CHQI API and return a bearer token."""
+    """Authenticate with the Ushauri DIFF platform and return a bearer token."""
     url = f"{settings.CHQI_API_BASE_URL}/api/auth/login"
     username = settings.CHQI_API_USERNAME
     password = settings.CHQI_API_PASSWORD
     if not username or not password:
         raise ValueError(
-            f"CHQI API credentials not configured "
+            f"Ushauri DIFF platform credentials not configured "
             f"(username={'set' if username else 'MISSING'}, "
             f"password={'set' if password else 'MISSING'})"
         )
@@ -272,7 +272,7 @@ def get_api_token():
 
 
 def upload_patients(patients, token, log=None, batch_size=10):
-    """POST patient data to the CHQI API in batches."""
+    """POST patient data to the Ushauri DIFF platform in batches."""
     import math
     url = f"{settings.CHQI_API_BASE_URL}/api/patients/upload-json"
     headers = {
