@@ -80,7 +80,7 @@ if [[ ! -f "$SECRETS_FILE_ENC" ]]; then
     exit 1
 fi
 
-prompt_silent gpg_passphrase "  Secrets passphrase: "
+prompt gpg_passphrase "  Secrets passphrase: "
 
 if ! secrets_plaintext=$(gpg --batch --quiet --pinentry-mode loopback \
         --passphrase "$gpg_passphrase" -d "$SECRETS_FILE_ENC" 2>/dev/null); then
@@ -113,8 +113,8 @@ if [[ "$configure_env" == "true" ]]; then
     echo "  Configuring environment variables..."
     echo
 
-    prompt        db_user     "  OpenMRS DB User: "
-    prompt_silent db_password "  OpenMRS DB Password: "
+    prompt db_user     "  OpenMRS DB User: "
+    prompt db_password "  OpenMRS DB Password: "
 
     cat > "$ENV_FILE" <<ENVEOF
 OPENMRS_DB_NAME=${DB_NAME}
