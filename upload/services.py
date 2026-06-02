@@ -42,7 +42,7 @@ LEFT JOIN openmrs.concept_name cn2
     )
     AND cn2.locale = 'en' 
     AND cn2.concept_name_type = 'FULLY_SPECIFIED'
-WHERE e.voided = 0 AND cn1.name LIKE '%viral%'),
+WHERE e.voided = 0 AND cn1.name LIKE '%%viral%%'),
 cd4 as (SELECT e.patient_id,
     o.value_numeric AS TestResults,
     o.obs_datetime AS TestDate
@@ -58,7 +58,7 @@ LEFT JOIN openmrs.concept_name cn1
     ON cn1.concept_id = o.concept_id
     AND cn1.locale = 'en' 
     AND cn1.concept_name_type = 'FULLY_SPECIFIED'
-WHERE e.voided = 0 AND cn1.name LIKE '%cd4%')
+WHERE e.voided = 0 AND cn1.name LIKE '%%cd4%%')
 select max(a.patient_id) as patient_id
 , max(a.visit_date) as visit_date 
 , max(appointment_date) as appointment_date
