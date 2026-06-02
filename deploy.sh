@@ -56,6 +56,9 @@ echo "  Done."
 
 # --- Clone or pull the repo ---
 echo "[2/9] Setting up application code..."
+# The repo is chowned to $SERVICE_USER below, but git runs here as root.
+# Mark it as a safe directory so git doesn't refuse with "dubious ownership".
+git config --global --add safe.directory "$APP_DIR"
 if [[ -d "$APP_DIR/.git" ]]; then
     echo "  Repository exists. Pulling latest changes..."
     git -C "$APP_DIR" pull --ff-only
