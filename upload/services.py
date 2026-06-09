@@ -68,14 +68,15 @@ select max(a.patient_id) as patient_id
 , max(a.age) as age
 , max(a.ccc_number) as ccc_number
 , max(a.phone_number) as phone_number
-, max(a.risk_classification) as risk_classification_value
-, coalesce(max(a.risk_score), (case when max(a.risk_classification) is null then 'Unknown'
-	when max(a.risk_classification) = 0 then 'Unknown'
+, coalesce(max(a.risk_score), max(a.risk_classification)) as risk_classification_value
+, coalesce(max(a.risk_description), (case when max(a.risk_classification) is null then 'Unknown Risk'
+	when max(a.risk_classification) = 0 then 'Unknown Risk'
 	when max(a.risk_classification) <= (select property_value from global_property where property='kenyaemrml.iit.lowRiskThreshold' limit 1) then 'Low Risk'
 	when max(a.risk_classification) <= (select property_value from global_property where property='kenyaemrml.iit.mediumRiskThreshold' limit 1) then 'Medium Risk'
 	when max(a.risk_classification) <= (select property_value from global_property where property='kenyaemrml.iit.highRiskThreshold' limit 1) then 'High Risk'
-	else 'Unknown'
+	else 'Unknown Risk'
 	end)) as risk_classification
+, coalesce(max(a.risk_date), max(a.risk_classification_date)) as risk_classification_date
 , max(a.risk_factors) as risk_factors
 , (select TestResults from vls x where x.patient_id=a.patient_id order by VLDate desc limit 1) as last_viral_load
 , (select VLDate from vls x where x.patient_id=a.patient_id order by VLDate desc limit 1) as last_viral_load_date
@@ -118,7 +119,8 @@ from
     and y.name ='Unique Patient Number' where x.patient_id = a.patient_id limit 1) as ccc_number
     , (select x.value from openmrs.person_attribute x inner join openmrs.person_attribute_type y on x.person_attribute_type_id =y.person_attribute_type_id
     and y.name='Telephone contact' where x.person_id = a.patient_id limit 1) as phone_number
-    , (select x.value_numeric from obs x where x.concept_id=167162 and x.person_id=a.patient_id order by x.obs_datetime desc limit 1) as risk_classification
+    , (select x.value_numeric from obs x where x.concept_id=167162 and x.person_id=a.patient_id and x.value_numeric>0 order by x.obs_datetime desc limit 1) as risk_classification
+    , (select x.obs_datetime from obs x where x.concept_id=167162 and x.person_id=a.patient_id and x.value_numeric>0 order by x.obs_datetime desc limit 1) as risk_classification_date
     , 'Pending' as appointment_status
     , c.name
     , d.county_district as county
@@ -134,8 +136,10 @@ from
     , (select x.name from openmrs.location x where x.location_id = a.location_id) as facility_name
     , (select case when x.value_coded=1065 then 'Yes' else 'No' end as response from obs x where x.concept_id=166607 and x.person_id=a.patient_id order by obs_datetime desc limit 1) as consented
     , (SELECT GROUP_CONCAT(y.name SEPARATOR ', ') FROM patient_program x INNER JOIN program y ON x.program_id = y.program_id and x.patient_id=a.patient_id WHERE x.date_completed IS NULL) AS program
-    , (select risk_score from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id order by x.evaluation_date desc limit 1) as risk_score
-    , (select risk_factors from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id order by x.evaluation_date desc limit 1) as risk_factors
+    , (select risk_score from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_score
+    , (select description from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_description
+    , (select risk_factors from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_factors
+    , (select evaluation_date from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_date
 	, null as lmp
 	, null as edd
 	, null as delivery_date
@@ -152,7 +156,7 @@ from
     and a.patient_id in (select x.patient_id from patient_program x
 						inner join program y on x.program_id =y.program_id 
 						where y.name ='HIV')
-) a where a.consented='Yes' group by a.patient_id
+) a where a.consented='Yes' group by a.patient_id, a.appointment_date
 """
 
 
@@ -217,6 +221,7 @@ def fetch_appointments(date_from, date_to):
             'facility_name': safe_str(record.get('facility_name')),
             'risk_classification': safe_str(record.get('risk_classification'), 'Unknown'),
             'risk_classification_value': safe_float(record.get('risk_classification_value')),
+            'risk_classification_date': safe_str(record.get('risk_classification_date')),
             'risk_factors': safe_str(record.get('risk_factors')),
             'last_viral_load': safe_str(record.get('last_viral_load')),
             'last_viral_load_date': safe_str(record.get('last_viral_load_date')),
