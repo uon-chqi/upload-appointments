@@ -210,15 +210,21 @@ else
     echo "[9/9] Setting up cron job (random off-hours slot: $(printf '%02d:%02d' "$RAND_HOUR" "$RAND_MIN"))..."
 fi
 
-CRON_CMD="cd $APP_DIR && $VENV_DIR/bin/python manage.py upload_appointments >> /var/log/upload-appointments.log 2>&1"
+# Self-update first (best-effort: a failed pull must not stop the upload, so
+# the two are joined with ';' not '&&'), then run the daily upload. Pulling
+# immediately before uploading means each run uses the latest code — e.g. an
+# updated SQL query — without any manual redeploy at the facility.
+UPDATE_LOG="/var/log/upload-appointments-update.log"
+CRON_CMD="cd $APP_DIR && bash $APP_DIR/update.sh >> $UPDATE_LOG 2>&1; $VENV_DIR/bin/python manage.py upload_appointments >> /var/log/upload-appointments.log 2>&1"
 CRON_LINE="$CRON_SCHEDULE $CRON_CMD"
 
 # Remove any existing cron entry for this app, then add the new one
 (crontab -l 2>/dev/null | grep -v "upload_appointments" || true; echo "$CRON_LINE") | crontab -
-touch /var/log/upload-appointments.log
-chmod 666 /var/log/upload-appointments.log
+touch /var/log/upload-appointments.log "$UPDATE_LOG"
+chmod 666 /var/log/upload-appointments.log "$UPDATE_LOG"
 echo "  Cron job installed: $CRON_SCHEDULE"
-echo "  Log file: /var/log/upload-appointments.log"
+echo "  Upload log: /var/log/upload-appointments.log"
+echo "  Update log: $UPDATE_LOG"
 
 echo
 echo "=========================================="
