@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import time
 import traceback
 
@@ -295,8 +296,81 @@ def get_api_token():
     return token
 
 
-def upload_patients(patients, token, log=None, batch_size=10):
-    """POST patient data to the Ushauri DIFF platform in batches."""
+def _backoff_delay(base_delay, attempt, cap=120):
+    """Exponential backoff with full jitter.
+
+    Returns a random delay in [0, min(cap, base_delay * 2**(attempt-1))]. The
+    jitter is what matters when ~250 facilities can hit the central API at
+    once: fixed backoff would just re-synchronise their retries into a second
+    stampede, whereas randomising the wait spreads them back out.
+    """
+    ceiling = min(cap, base_delay * (2 ** (attempt - 1)))
+    return random.uniform(0, ceiling)
+
+
+def _post_batch_with_retry(url, payload, headers, batch_num, total_batches,
+                           max_retries=4, base_delay=5, timeout=120):
+    """POST one batch, retrying transient failures with backoff + jitter.
+
+    Retries on connection errors, timeouts, HTTP 429, and 5xx responses.
+    Raises immediately on non-retryable client errors (4xx other than 429)
+    and once retries are exhausted.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(url, data=payload, headers=headers, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt >= max_retries:
+                raise
+            delay = _backoff_delay(base_delay, attempt)
+            logger.warning(
+                "Batch %d/%d network error (attempt %d/%d): %s; retrying in %.1fs",
+                batch_num, total_batches, attempt, max_retries, exc, delay,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.ok:
+            return response
+
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+
+        retryable = response.status_code == 429 or response.status_code >= 500
+        if not retryable or attempt >= max_retries:
+            raise requests.HTTPError(
+                f"HTTP {response.status_code}: {detail}",
+                response=response,
+            )
+
+        # Honour Retry-After when the server sends it (common with 429),
+        # otherwise fall back to jittered exponential backoff.
+        retry_after = response.headers.get('Retry-After', '')
+        if retry_after.isdigit():
+            delay = int(retry_after)
+        else:
+            delay = _backoff_delay(base_delay, attempt)
+        logger.warning(
+            "Batch %d/%d failed HTTP %s (attempt %d/%d): %s; retrying in %.1fs",
+            batch_num, total_batches, response.status_code,
+            attempt, max_retries, detail, delay,
+        )
+        time.sleep(delay)
+
+    # Unreachable: the loop either returns, raises, or exhausts via the
+    # attempt >= max_retries guards above.
+    raise requests.HTTPError(f"Batch {batch_num} failed after {max_retries} attempts")
+
+
+def upload_patients(patients, token, log=None, batch_size=10, max_retries=4):
+    """POST patient data to the Ushauri DIFF platform in batches.
+
+    Each batch is retried with exponential backoff + jitter on transient
+    failures so a momentary spike at the central API doesn't drop a facility's
+    daily upload.
+    """
     import math
     url = f"{settings.CHQI_API_BASE_URL}/api/patients/upload-json"
     headers = {
@@ -315,21 +389,14 @@ def upload_patients(patients, token, log=None, batch_size=10):
         batch_num = i // batch_size + 1
         logger.info("Uploading batch %d/%d (%d–%d of %d patients)",
                      batch_num, total_batches, i + 1, i + len(batch), len(patients))
-        response = requests.post(
+        response = _post_batch_with_retry(
             url,
-            data=json.dumps({'patients': batch}),
-            headers=headers,
-            timeout=1000,
+            json.dumps({'patients': batch}),
+            headers,
+            batch_num,
+            total_batches,
+            max_retries=max_retries,
         )
-        if not response.ok:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-            raise requests.HTTPError(
-                f"HTTP {response.status_code}: {detail}",
-                response=response,
-            )
         results.append(response.json())
         if log:
             log.batches_completed = batch_num

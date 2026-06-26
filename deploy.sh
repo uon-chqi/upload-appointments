@@ -4,7 +4,6 @@ set -euo pipefail
 APP_DIR="/opt/upload-appointments"
 VENV_DIR="$APP_DIR/venv"
 REPO_URL="https://github.com/uon-chqi/upload-appointments.git"
-CRON_SCHEDULE="0 23 * * *"
 SERVICE_NAME="upload-appointments"
 SERVICE_USER="www-data"
 
@@ -190,7 +189,27 @@ systemctl restart "$SERVICE_NAME"
 echo "  Gunicorn service started on port $SERVER_PORT."
 
 # --- Set up cron job ---
-echo "[9/9] Setting up cron job (daily at 11:00 PM)..."
+# Each facility uploads once a day at a RANDOM time in the 6pm–6am off-hours
+# window. With ~250 facilities all reporting to one central API, a fixed time
+# (e.g. 11pm) would cause a thundering-herd spike; spreading the start times
+# across the 12-hour idle window keeps peak concurrency low.
+#
+# The time is chosen ONCE at first install and preserved on later re-deploys,
+# so updating the app does not reshuffle this facility to a new slot.
+EXISTING_SCHEDULE=$(crontab -l 2>/dev/null | grep "upload_appointments" | head -n1 | awk '{print $1, $2, $3, $4, $5}' || true)
+
+if [[ -n "$EXISTING_SCHEDULE" ]]; then
+    CRON_SCHEDULE="$EXISTING_SCHEDULE"
+    echo "[9/9] Keeping existing upload schedule ($CRON_SCHEDULE)..."
+else
+    # Off-hours window 6pm–6am wraps midnight, so list the hours explicitly.
+    WINDOW_HOURS=(18 19 20 21 22 23 0 1 2 3 4 5)
+    RAND_HOUR=${WINDOW_HOURS[$((RANDOM % ${#WINDOW_HOURS[@]}))]}
+    RAND_MIN=$((RANDOM % 60))
+    CRON_SCHEDULE="$RAND_MIN $RAND_HOUR * * *"
+    echo "[9/9] Setting up cron job (random off-hours slot: $(printf '%02d:%02d' "$RAND_HOUR" "$RAND_MIN"))..."
+fi
+
 CRON_CMD="cd $APP_DIR && $VENV_DIR/bin/python manage.py upload_appointments >> /var/log/upload-appointments.log 2>&1"
 CRON_LINE="$CRON_SCHEDULE $CRON_CMD"
 
@@ -211,7 +230,7 @@ echo "  Virtual env:   $VENV_DIR"
 echo "  Config:        $ENV_FILE"
 echo "  Service:       systemctl status $SERVICE_NAME"
 echo "  Running on:    http://0.0.0.0:$SERVER_PORT"
-echo "  Cron:          Daily at 11:00 PM"
+echo "  Cron:          Daily at $CRON_SCHEDULE (random off-hours slot)"
 echo "  Log:           /var/log/upload-appointments.log"
 echo
 echo "  Useful commands:"
