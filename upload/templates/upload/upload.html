@@ -1,248 +1,179 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload Appointments</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
-        .container { max-width: 960px; margin: 0 auto; padding: 20px; }
-        h1 { margin-bottom: 20px; color: #2c3e50; }
-        h2 { margin: 30px 0 15px; color: #2c3e50; }
+{% extends "upload/base.html" %}
 
-        .card { background: #fff; border-radius: 8px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 20px; }
+{# No link to /multi-facilities: the URL is shared directly with the clients who
+   need it. The page itself is still staff-only — this only keeps it out of sight. #}
 
-        .form-group { margin-bottom: 16px; }
-        .form-group label { display: block; margin-bottom: 6px; font-weight: 600; font-size: 14px; }
-        .form-control { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
-        .form-row { display: flex; gap: 16px; }
-        .form-row .form-group { flex: 1; }
-
-        .btn { padding: 10px 24px; border: none; border-radius: 4px; font-size: 14px; font-weight: 600; cursor: pointer; }
-        .btn-primary { background: #3498db; color: #fff; }
-        .btn-primary:hover { background: #2980b9; }
-        .btn-primary:disabled { background: #a0c4e8; cursor: not-allowed; opacity: 0.7; }
-
-        .alert { padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }
-        .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .alert-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-
-        .errors { color: #e74c3c; margin-bottom: 12px; font-size: 14px; }
-
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        thead th { background: #f8f9fa; padding: 10px 12px; text-align: left; border-bottom: 2px solid #dee2e6; font-weight: 600; }
-        tbody td { padding: 10px 12px; border-bottom: 1px solid #eee; }
-        tbody tr:hover { background: #f8f9fa; }
-
-        .badge { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-        .badge-success { background: #d4edda; color: #155724; }
-        .badge-failed { background: #f8d7da; color: #721c24; }
-        .badge-pending, .badge-in_progress { background: #fff3cd; color: #856404; }
-        .badge-cron { background: #e2e3f1; color: #383d6e; }
-        .badge-manual { background: #fff3cd; color: #856404; }
-
-        .error-text { max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; font-size: 12px; color: #999; }
-        .error-text:hover { white-space: normal; overflow: visible; }
-        .empty { text-align: center; padding: 40px; color: #999; }
-        .nav { margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
-        .nav a { color: #3498db; text-decoration: none; font-size: 14px; }
-
-        .progress-container { display: none; margin-top: 16px; }
-        .progress-bar-wrapper { background: #e9ecef; border-radius: 8px; overflow: hidden; height: 24px; }
-        .progress-bar { height: 100%; background: #3498db; border-radius: 8px; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 600; min-width: 40px; }
-        .progress-status { margin-top: 8px; font-size: 13px; color: #666; }
-        .progress-status.status-success { color: #155724; font-weight: 600; }
-        .progress-status.status-failed { color: #721c24; font-weight: 600; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="nav">
-            <h1>Upload Appointments</h1>
+{% block content %}
+    {% if multi_enabled %}
+        <div class="alert alert-info">
+            Multi-facility mode is enabled, so the nightly job uploads every configured facility.
+            Uploading from this page only covers the environment-configured facility.
         </div>
+    {% endif %}
 
-        {% for message in messages %}
-            <div class="alert {% if message.tags == 'success' %}alert-success{% else %}alert-error{% endif %}">
-                {{ message }}
-            </div>
-        {% endfor %}
-
-        <div class="card">
-            <h2 style="margin-top:0">Manual Upload</h2>
-            <p style="margin-bottom:16px; color:#666; font-size:14px;">
-                Select a date range and upload appointment data to Ushauri DIFF platform.
-            </p>
-            <form method="post">
-                {% csrf_token %}
-                {% if form.non_field_errors %}
-                    <div class="errors">
-                        {% for error in form.non_field_errors %}
-                            <p>{{ error }}</p>
-                        {% endfor %}
-                    </div>
-                {% endif %}
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="{{ form.date_from.id_for_label }}">From Date</label>
-                        {{ form.date_from }}
-                        {% if form.date_from.errors %}
-                            <div class="errors">{{ form.date_from.errors.0 }}</div>
-                        {% endif %}
-                    </div>
-                    <div class="form-group">
-                        <label for="{{ form.date_to.id_for_label }}">To Date</label>
-                        {{ form.date_to }}
-                        {% if form.date_to.errors %}
-                            <div class="errors">{{ form.date_to.errors.0 }}</div>
-                        {% endif %}
-                    </div>
+    <div class="card">
+        <h2 style="margin-top:0">Manual Upload</h2>
+        <p style="margin-bottom:16px; color:#666; font-size:14px;">
+            Select a date range and upload appointment data to Ushauri DIFF platform.
+        </p>
+        <form method="post" id="upload-form">
+            {% csrf_token %}
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="{{ form.date_from.id_for_label }}">From Date</label>
+                    {{ form.date_from }}
                 </div>
-                <button type="submit" class="btn btn-primary" id="upload-btn">Upload Now</button>
-            </form>
-            <div class="progress-container" id="progress-container">
-                <div class="progress-bar-wrapper">
-                    <div class="progress-bar" id="progress-bar" style="width: 0%">0%</div>
+                <div class="form-group">
+                    <label for="{{ form.date_to.id_for_label }}">To Date</label>
+                    {{ form.date_to }}
                 </div>
-                <div class="progress-status" id="progress-status">Starting upload...</div>
             </div>
-        </div>
-
-        <div class="card">
-            <h2 style="margin-top:0">Upload History</h2>
-            {% if logs %}
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date Range</th>
-                            <th>Trigger</th>
-                            <th>User</th>
-                            <th>Status</th>
-                            <th>Records</th>
-                            <th>Time</th>
-                            <th>Error</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for log in logs %}
-                        <tr>
-                            <td>{{ log.date_from }} — {{ log.date_to }}</td>
-                            <td>
-                                <span class="badge {% if log.triggered_by == 'cron' %}badge-cron{% else %}badge-manual{% endif %}">
-                                    {{ log.get_triggered_by_display }}
-                                </span>
-                            </td>
-                            <td>{{ log.triggered_by_user|default:"—" }}</td>
-                            <td>
-                                <span class="badge badge-{{ log.status }}">
-                                    {{ log.get_status_display }}
-                                </span>
-                            </td>
-                            <td>{{ log.records_uploaded }}</td>
-                            <td>{{ log.created_at|date:"Y-m-d H:i" }}</td>
-                            <td>
-                                {% if log.error_message %}
-                                    <span class="error-text" title="{{ log.error_message }}">{{ log.error_message|truncatechars:60 }}</span>
-                                {% else %}
-                                    —
-                                {% endif %}
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            {% else %}
-                <div class="empty">No uploads yet.</div>
-            {% endif %}
+            <button type="submit" class="btn btn-primary" id="upload-btn">Upload Now</button>
+        </form>
+        <div class="progress-container" id="progress-container">
+            <div class="progress-bar-wrapper">
+                <div class="progress-bar" id="progress-bar" style="width: 0%">0%</div>
+            </div>
+            <div class="progress-status" id="progress-status">Starting upload...</div>
         </div>
     </div>
 
-    <script>
-    (function() {
-        const form = document.querySelector('form[method="post"]');
-        const btn = document.getElementById('upload-btn');
-        const progressContainer = document.getElementById('progress-container');
-        const progressBar = document.getElementById('progress-bar');
-        const progressStatus = document.getElementById('progress-status');
+    <div class="card">
+        <h2 style="margin-top:0">Upload History</h2>
+        {% if logs %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date Range</th>
+                        <th>Trigger</th>
+                        <th>User</th>
+                        <th>Status</th>
+                        <th>Records</th>
+                        <th>Time</th>
+                        <th>Error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for log in logs %}
+                    <tr>
+                        <td>{{ log.date_from }} — {{ log.date_to }}</td>
+                        <td>
+                            <span class="badge {% if log.triggered_by == 'cron' %}badge-cron{% else %}badge-manual{% endif %}">
+                                {{ log.get_triggered_by_display }}
+                            </span>
+                        </td>
+                        <td>{{ log.triggered_by_user|default:"—" }}</td>
+                        <td>
+                            <span class="badge badge-{{ log.status }}">
+                                {{ log.get_status_display }}
+                            </span>
+                        </td>
+                        <td>{{ log.records_uploaded }}</td>
+                        <td>{{ log.created_at|date:"Y-m-d H:i" }}</td>
+                        <td>
+                            {% if log.error_message %}
+                                <span class="error-text" title="{{ log.error_message }}">{{ log.error_message|truncatechars:60 }}</span>
+                            {% else %}
+                                —
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <div class="empty">No uploads yet.</div>
+        {% endif %}
+    </div>
+{% endblock %}
 
-        form.addEventListener('submit', function(e) {
-            e.preventDefault();
+{% block scripts %}
+<script>
+(function() {
+    const form = document.getElementById('upload-form');
+    const btn = document.getElementById('upload-btn');
+    const progressContainer = document.getElementById('progress-container');
+    const progressBar = document.getElementById('progress-bar');
+    const progressStatus = document.getElementById('progress-status');
+    const progressUrl = '{% url "upload:run_progress" run_id=0 %}';
 
-            btn.disabled = true;
-            btn.textContent = 'Uploading...';
-            progressContainer.style.display = 'block';
-            progressBar.style.width = '0%';
-            progressBar.textContent = '0%';
-            progressStatus.textContent = 'Starting upload...';
-            progressStatus.className = 'progress-status';
+    function reset(message, cls) {
+        progressStatus.textContent = message;
+        progressStatus.className = 'progress-status ' + (cls || '');
+        btn.disabled = false;
+        btn.textContent = 'Upload Now';
+    }
 
-            const formData = new FormData(form);
+    form.addEventListener('submit', function(e) {
+        e.preventDefault();
 
-            fetch(form.action || window.location.href, {
-                method: 'POST',
-                body: formData,
-                headers: {
-                    'X-Requested-With': 'XMLHttpRequest',
-                },
-            })
+        btn.disabled = true;
+        btn.textContent = 'Uploading...';
+        progressContainer.style.display = 'block';
+        progressBar.style.width = '0%';
+        progressBar.textContent = '0%';
+        progressBar.style.background = '#3498db';
+        progressStatus.textContent = 'Starting upload...';
+        progressStatus.className = 'progress-status';
+
+        fetch(form.action || window.location.href, {
+            method: 'POST',
+            body: new FormData(form),
+            headers: {'X-Requested-With': 'XMLHttpRequest'},
+        })
+        .then(function(resp) { return resp.json().then(function(data) { return {ok: resp.ok, data: data}; }); })
+        .then(function(result) {
+            if (!result.ok) {
+                reset(result.data.error || 'Could not start upload.', 'status-failed');
+                return;
+            }
+            pollProgress(result.data.run_id);
+        })
+        .catch(function(err) {
+            reset('Error starting upload: ' + err, 'status-failed');
+        });
+    });
+
+    function pollProgress(runId) {
+        const url = progressUrl.replace('/0/', '/' + runId + '/');
+        const interval = setInterval(function() {
+            fetch(url)
             .then(function(resp) { return resp.json(); })
             .then(function(data) {
-                if (data.log_id) {
-                    pollProgress(data.log_id);
+                // Single-facility runs always carry exactly one facility.
+                const facility = (data.facilities || [])[0] || {};
+
+                if (data.status === 'pending') {
+                    progressStatus.textContent = 'Waiting for the upload process to start...';
+                    return;
+                }
+
+                if (facility.batches_total > 0) {
+                    const pct = Math.round((facility.batches_completed / facility.batches_total) * 100);
+                    progressBar.style.width = pct + '%';
+                    progressBar.textContent = pct + '%';
+                    progressStatus.textContent = 'Uploading batch ' + facility.batches_completed +
+                        ' of ' + facility.batches_total + ' (' + facility.records_uploaded + ' records)';
+                } else if (data.status === 'in_progress') {
+                    progressStatus.textContent = 'Querying appointments...';
+                }
+
+                if (data.status === 'success') {
+                    clearInterval(interval);
+                    progressBar.style.width = '100%';
+                    progressBar.textContent = '100%';
+                    progressBar.style.background = '#28a745';
+                    reset('Upload complete — ' + data.records_uploaded + ' records uploaded.', 'status-success');
+                    setTimeout(function() { location.reload(); }, 2000);
+                } else if (data.status === 'failed' || data.status === 'partial') {
+                    clearInterval(interval);
+                    progressBar.style.background = '#dc3545';
+                    reset('Upload failed: ' + (facility.error_message || data.message), 'status-failed');
                 }
             })
-            .catch(function(err) {
-                progressStatus.textContent = 'Error starting upload: ' + err;
-                progressStatus.className = 'progress-status status-failed';
-                btn.disabled = false;
-                btn.textContent = 'Upload Now';
-            });
-        });
-
-        function pollProgress(logId) {
-            const url = '{% url "upload:upload_progress" log_id=0 %}'.replace('/0/', '/' + logId + '/');
-            const interval = setInterval(function() {
-                fetch(url)
-                .then(function(resp) { return resp.json(); })
-                .then(function(data) {
-                    if (data.status === 'pending') {
-                        progressStatus.textContent = 'Querying appointments...';
-                        return;
-                    }
-
-                    if (data.batches_total > 0) {
-                        const pct = Math.round((data.batches_completed / data.batches_total) * 100);
-                        progressBar.style.width = pct + '%';
-                        progressBar.textContent = pct + '%';
-                        progressStatus.textContent = 'Uploading batch ' + data.batches_completed + ' of ' + data.batches_total +
-                            ' (' + data.records_uploaded + ' records)';
-                    } else if (data.status === 'in_progress') {
-                        progressStatus.textContent = 'Fetching records...';
-                    }
-
-                    if (data.status === 'success') {
-                        clearInterval(interval);
-                        progressBar.style.width = '100%';
-                        progressBar.textContent = '100%';
-                        progressBar.style.background = '#28a745';
-                        progressStatus.textContent = 'Upload complete — ' + data.records_uploaded + ' records uploaded.';
-                        progressStatus.className = 'progress-status status-success';
-                        btn.disabled = false;
-                        btn.textContent = 'Upload Now';
-                        setTimeout(function() { location.reload(); }, 2000);
-                    } else if (data.status === 'failed') {
-                        clearInterval(interval);
-                        progressBar.style.background = '#dc3545';
-                        progressStatus.textContent = 'Upload failed: ' + data.error_message;
-                        progressStatus.className = 'progress-status status-failed';
-                        btn.disabled = false;
-                        btn.textContent = 'Upload Now';
-                    }
-                })
-                .catch(function() {});
-            }, 1500);
-        }
-    })();
-    </script>
-</body>
-</html>
+            .catch(function() {});
+        }, 1500);
+    }
+})();
+</script>
+{% endblock %}

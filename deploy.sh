@@ -118,6 +118,16 @@ if [[ "$configure_env" == "true" ]]; then
     prompt db_user     "  OpenMRS DB User: "
     prompt db_password "  OpenMRS DB Password: "
 
+    # These two must survive a re-install. FIELD_ENCRYPTION_KEY decrypts the
+    # facility MySQL passwords stored in db.sqlite3, and DJANGO_SECRET_KEY backs
+    # existing sessions — regenerating either would silently break a working
+    # multi-facility install. Reuse whatever the old .env had.
+    existing_key() { grep -s "^$1=" "$ENV_FILE" | head -n1 | cut -d= -f2- || true; }
+    FIELD_ENCRYPTION_KEY="$(existing_key FIELD_ENCRYPTION_KEY)"
+    FIELD_ENCRYPTION_KEY="${FIELD_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
+    DJANGO_SECRET_KEY="$(existing_key DJANGO_SECRET_KEY)"
+    DJANGO_SECRET_KEY="${DJANGO_SECRET_KEY:-$(openssl rand -hex 32)}"
+
     cat > "$ENV_FILE" <<ENVEOF
 OPENMRS_DB_NAME=${DB_NAME}
 OPENMRS_DB_USER=${db_user}
@@ -127,6 +137,10 @@ OPENMRS_DB_PORT=${DB_PORT}
 CHQI_API_BASE_URL=${API_BASE_URL}
 CHQI_API_USERNAME=${CHQI_API_USERNAME}
 CHQI_API_PASSWORD=${CHQI_API_PASSWORD}
+DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+FIELD_ENCRYPTION_KEY=${FIELD_ENCRYPTION_KEY}
+DJANGO_DEBUG=False
+DJANGO_ALLOWED_HOSTS=*
 ENVEOF
 
     chmod 640 "$ENV_FILE"
@@ -160,7 +174,9 @@ fi
 # --- Set file ownership ---
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
 chmod 777 "$APP_DIR"
-chmod 666 "$APP_DIR/db.sqlite3"
+# The glob covers db.sqlite3-wal and -shm: in WAL mode those persist and are
+# shared between the web process and the upload process, so both must write them.
+chmod 666 "$APP_DIR"/db.sqlite3* 2>/dev/null || true
 
 # --- Set up Gunicorn systemd service ---
 echo "[8/9] Setting up Gunicorn service..."
@@ -214,8 +230,14 @@ fi
 # the two are joined with ';' not '&&'), then run the daily upload. Pulling
 # immediately before uploading means each run uses the latest code — e.g. an
 # updated SQL query — without any manual redeploy at the facility.
+#
+# The upload runs as $SERVICE_USER, not root. In WAL mode SQLite keeps
+# db.sqlite3-wal and -shm alongside the database, and whichever user creates
+# them owns them — a root-owned WAL would lock the www-data web process out of
+# its own database. update.sh still needs root for systemctl.
 UPDATE_LOG="/var/log/upload-appointments-update.log"
-CRON_CMD="cd $APP_DIR && bash $APP_DIR/update.sh >> $UPDATE_LOG 2>&1; $VENV_DIR/bin/python manage.py upload_appointments >> /var/log/upload-appointments.log 2>&1"
+UPLOAD_CMD="$VENV_DIR/bin/python $APP_DIR/manage.py upload_appointments"
+CRON_CMD="cd $APP_DIR && bash $APP_DIR/update.sh >> $UPDATE_LOG 2>&1; su -s /bin/sh -c '$UPLOAD_CMD' $SERVICE_USER >> /var/log/upload-appointments.log 2>&1"
 CRON_LINE="$CRON_SCHEDULE $CRON_CMD"
 
 # Remove any existing cron entry for this app, then add the new one

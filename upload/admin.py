@@ -1,11 +1,57 @@
 from django.contrib import admin
 
-from .models import UploadLog
+from .models import AppSettings, Facility, UploadLog, UploadRun
+
+
+@admin.register(AppSettings)
+class AppSettingsAdmin(admin.ModelAdmin):
+    list_display = ['multi_facility_enabled', 'updated_at']
+
+    def has_add_permission(self, request):
+        return not AppSettings.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(Facility)
+class FacilityAdmin(admin.ModelAdmin):
+    list_display = ['name', 'host', 'port', 'database_name', 'mfl_code', 'is_active', 'last_test_ok']
+    list_filter = ['is_active', 'last_test_ok']
+    search_fields = ['name', 'host', 'mfl_code']
+    # password_encrypted is deliberately absent: nothing should render it.
+    fields = ['name', 'host', 'port', 'database_name', 'username', 'is_active',
+              'mfl_code', 'mfl_facility_name', 'last_tested_at', 'last_test_ok',
+              'last_test_message']
+    readonly_fields = ['mfl_code', 'mfl_facility_name', 'last_tested_at',
+                       'last_test_ok', 'last_test_message']
+
+
+class UploadLogInline(admin.TabularInline):
+    model = UploadLog
+    extra = 0
+    fields = ['facility_label', 'status', 'records_uploaded', 'batches_completed',
+              'batches_total', 'finished_at']
+    readonly_fields = fields
+    can_delete = False
+
+
+@admin.register(UploadRun)
+class UploadRunAdmin(admin.ModelAdmin):
+    list_display = ['date_from', 'date_to', 'mode', 'triggered_by', 'status',
+                    'facilities_completed', 'facilities_total', 'facilities_failed',
+                    'records_uploaded', 'created_at']
+    list_filter = ['status', 'mode', 'triggered_by', 'created_at']
+    inlines = [UploadLogInline]
 
 
 @admin.register(UploadLog)
 class UploadLogAdmin(admin.ModelAdmin):
-    list_display = ['date_from', 'date_to', 'triggered_by', 'triggered_by_user', 'status', 'records_uploaded', 'created_at']
+    list_display = ['date_from', 'date_to', 'facility_label', 'triggered_by',
+                    'triggered_by_user', 'status', 'records_uploaded', 'created_at']
     list_filter = ['status', 'triggered_by', 'created_at']
-    search_fields = ['error_message']
-    readonly_fields = ['date_from', 'date_to', 'triggered_by', 'triggered_by_user', 'status', 'records_uploaded', 'error_message', 'created_at']
+    search_fields = ['error_message', 'facility_label']
+    readonly_fields = ['run', 'facility', 'facility_label', 'date_from', 'date_to',
+                       'triggered_by', 'triggered_by_user', 'status', 'records_uploaded',
+                       'batches_total', 'batches_completed', 'error_message',
+                       'started_at', 'finished_at', 'created_at']

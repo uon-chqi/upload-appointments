@@ -25,12 +25,17 @@ load_dotenv(BASE_DIR / '.env')
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-xa+%)g3*u)$%nr3l$trs+x##wy(1cdck5+e7#g2n+b*)l=1t)g'
+# Facility MySQL passwords are encrypted with a key derived from SECRET_KEY when
+# FIELD_ENCRYPTION_KEY is unset, so changing this value invalidates them.
+SECRET_KEY = os.environ.get(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-xa+%)g3*u)$%nr3l$trs+x##wy(1cdck5+e7#g2n+b*)l=1t)g',
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() in ('1', 'true', 'yes')
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = [h for h in os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',') if h]
 
 
 # Application definition
@@ -47,6 +52,9 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Serves STATIC_ROOT under gunicorn, so DEBUG can be False in production
+    # without the admin losing its stylesheets.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -78,26 +86,20 @@ WSGI_APPLICATION = 'uploadappointments.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# OpenMRS is not a Django database alias: each facility is a separate KenyaEMR
+# container reached through upload.openmrs, which opens a MySQL connection per
+# facility. See OPENMRS_DB_* below for the single-facility connection.
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
-    },
-    'openmrs': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('OPENMRS_DB_NAME', ''),
-        'USER': os.environ.get('OPENMRS_DB_USER', ''),
-        'PASSWORD': os.environ.get('OPENMRS_DB_PASSWORD', ''),
-        'HOST': os.environ.get('OPENMRS_DB_HOST', ''),
-        'PORT': os.environ.get('OPENMRS_DB_PORT', ''),
         'OPTIONS': {
-            'read_default_file': '',
-            'charset': 'utf8mb4',
+            # Upload workers write progress concurrently; without this they hit
+            # "database is locked" instead of waiting their turn.
+            'timeout': 20,
         },
     },
 }
-
-DATABASE_ROUTERS = ['upload.db_router.OpenmrsRouter']
 
 
 # Password validation
@@ -142,10 +144,32 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# OpenMRS connection used in single-facility mode. In multi-facility mode these
+# are ignored and each Facility row supplies its own connection details.
+OPENMRS_DB_NAME = os.environ.get('OPENMRS_DB_NAME', '')
+OPENMRS_DB_USER = os.environ.get('OPENMRS_DB_USER', '')
+OPENMRS_DB_PASSWORD = os.environ.get('OPENMRS_DB_PASSWORD', '')
+OPENMRS_DB_HOST = os.environ.get('OPENMRS_DB_HOST', '')
+OPENMRS_DB_PORT = os.environ.get('OPENMRS_DB_PORT', '3306')
+OPENMRS_DB_LABEL = os.environ.get('OPENMRS_DB_LABEL', 'Local facility')
+
 # API Configuration
 CHQI_API_BASE_URL = os.environ.get('CHQI_API_BASE_URL', '')
 CHQI_API_USERNAME = os.environ.get('CHQI_API_USERNAME', '')
 CHQI_API_PASSWORD = os.environ.get('CHQI_API_PASSWORD', '')
+
+# Upload behaviour
+UPLOAD_BATCH_SIZE = int(os.environ.get('UPLOAD_BATCH_SIZE', '10'))
+# The central API is the only shared bottleneck (each facility has its own
+# MySQL), so this is the one number to tune. Conservative until its rate limit
+# is known: 100 facilities at ~2 minutes each finishes in roughly 40 minutes.
+MULTI_FACILITY_WORKERS = int(os.environ.get('MULTI_FACILITY_WORKERS', '5'))
+# A run whose heartbeat goes quiet for this long is assumed dead.
+UPLOAD_STALE_MINUTES = int(os.environ.get('UPLOAD_STALE_MINUTES', '20'))
+
+# Encrypts facility MySQL passwords at rest. Falls back to SECRET_KEY when unset;
+# rotating whichever is in use means re-entering every facility password.
+FIELD_ENCRYPTION_KEY = os.environ.get('FIELD_ENCRYPTION_KEY', '')
 
 LOGIN_URL = '/accounts/login/'
 LOGIN_REDIRECT_URL = '/'

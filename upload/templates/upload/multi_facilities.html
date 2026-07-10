@@ -1,0 +1,562 @@
+{% extends "upload/base.html" %}
+
+{% block title %}Multi-Facility Upload{% endblock %}
+{% block heading %}Multi-Facility Upload{% endblock %}
+
+{% block nav_links %}<a href="{% url 'upload:upload' %}">&larr; Single facility</a>{% endblock %}
+
+{% block content %}
+<div class="tabs">
+    <button class="tab active" data-panel="setup">Facility Setup</button>
+    <button class="tab" data-panel="upload">Upload Data</button>
+</div>
+
+{# ------------------------------- Facility setup ------------------------------ #}
+<div class="tab-panel active" id="panel-setup">
+    <div class="card">
+        <form method="post" action="{% url 'upload:multi_settings' %}">
+            {% csrf_token %}
+            <label style="display:flex; align-items:center; gap:10px; font-weight:600;">
+                <input type="checkbox" name="multi_facility_enabled"
+                       {% if settings_obj.multi_facility_enabled %}checked{% endif %}
+                       onchange="this.form.submit()">
+                Enable multi-facilities mode
+            </label>
+            <div class="help">
+                Controls the nightly cron job only. When enabled it uploads every active
+                facility below; when disabled it uploads the environment-configured facility.
+                Manual uploads on this page work either way.
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>Facilities ({{ facilities|length }})</h2>
+            <button type="button" class="btn btn-primary" id="add-facility-btn">Add Facility</button>
+        </div>
+        {% if facilities %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Connection</th>
+                    <th>User</th>
+                    <th>MFL</th>
+                    <th>Last Test</th>
+                    <th>Active</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for facility in facilities %}
+                <tr>
+                    <td><strong>{{ facility.name }}</strong></td>
+                    <td class="mono">{{ facility.host }}:{{ facility.port }}/{{ facility.database_name }}</td>
+                    <td class="mono">{{ facility.username }}</td>
+                    <td>
+                        {% if facility.mfl_code %}
+                            <span class="mono">{{ facility.mfl_code }}</span>
+                        {% else %}
+                            <span class="muted">not tested</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if facility.last_tested_at %}
+                            <span class="badge {% if facility.last_test_ok %}badge-success{% else %}badge-failed{% endif %}"
+                                  title="{{ facility.last_test_message }}">
+                                {% if facility.last_test_ok %}OK{% else %}Failed{% endif %}
+                            </span>
+                            <span class="muted">{{ facility.last_tested_at|date:"M j, H:i" }}</span>
+                        {% else %}
+                            <span class="badge badge-muted">Never</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if facility.is_active %}
+                            <span class="badge badge-success">Yes</span>
+                        {% else %}
+                            <span class="badge badge-muted">No</span>
+                        {% endif %}
+                    </td>
+                    <td style="white-space:nowrap">
+                        <button type="button" class="btn btn-secondary btn-sm edit-btn"
+                                data-pk="{{ facility.pk }}"
+                                data-name="{{ facility.name }}"
+                                data-host="{{ facility.host }}"
+                                data-port="{{ facility.port }}"
+                                data-database="{{ facility.database_name }}"
+                                data-username="{{ facility.username }}"
+                                data-active="{{ facility.is_active|yesno:'1,0' }}">Edit</button>
+                        <form method="post" action="{% url 'upload:facility_delete' pk=facility.pk %}"
+                              style="display:inline"
+                              onsubmit="return confirm('Delete {{ facility.name|escapejs }}? Its upload history is kept.');">
+                            {% csrf_token %}
+                            <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+            <div class="empty">No facilities added yet.</div>
+        {% endif %}
+    </div>
+
+    <div class="modal-backdrop {% if facility_form.errors %}open{% endif %}" id="facility-modal">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="facility-form-title">
+            <div class="modal-header">
+                <h2 id="facility-form-title">
+                    {% if editing_pk %}Edit Facility{% else %}Add Facility{% endif %}
+                </h2>
+                <button type="button" class="modal-close" id="modal-close" aria-label="Close">&times;</button>
+            </div>
+
+            <form method="post" id="facility-form"
+                  data-editing-pk="{{ editing_pk|default_if_none:'' }}"
+                  action="{% if editing_pk %}{% url 'upload:facility_edit' pk=editing_pk %}{% else %}{% url 'upload:facility_add' %}{% endif %}">
+                {% csrf_token %}
+                {% if facility_form.non_field_errors %}
+                    <div class="errors">{{ facility_form.non_field_errors }}</div>
+                {% endif %}
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="{{ facility_form.name.id_for_label }}">Facility Name</label>
+                        {{ facility_form.name }}
+                        {% if facility_form.name.errors %}<div class="errors">{{ facility_form.name.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group">
+                        <label for="{{ facility_form.host.id_for_label }}">MySQL Host</label>
+                        {{ facility_form.host }}
+                        <div class="help">Container name, hostname, or IP.</div>
+                        {% if facility_form.host.errors %}<div class="errors">{{ facility_form.host.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group" style="max-width:120px">
+                        <label for="{{ facility_form.port.id_for_label }}">Port</label>
+                        {{ facility_form.port }}
+                        {% if facility_form.port.errors %}<div class="errors">{{ facility_form.port.errors.0 }}</div>{% endif %}
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="{{ facility_form.database_name.id_for_label }}">Database Name</label>
+                        {{ facility_form.database_name }}
+                        {% if facility_form.database_name.errors %}<div class="errors">{{ facility_form.database_name.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group">
+                        <label for="{{ facility_form.username.id_for_label }}">MySQL User</label>
+                        {{ facility_form.username }}
+                        <div class="help">A read-only user is sufficient.</div>
+                        {% if facility_form.username.errors %}<div class="errors">{{ facility_form.username.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group">
+                        <label for="{{ facility_form.password.id_for_label }}">MySQL Password</label>
+                        {{ facility_form.password }}
+                        <div class="help" id="password-help">Stored encrypted.</div>
+                        {% if facility_form.password.errors %}<div class="errors">{{ facility_form.password.errors.0 }}</div>{% endif %}
+                    </div>
+                </div>
+                <label style="display:flex; align-items:center; gap:8px; font-size:14px;">
+                    {{ facility_form.is_active }} Active
+                </label>
+
+                <div id="test-result" style="margin-top:16px"></div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="test-btn">Test Connection</button>
+                    <div class="spacer"></div>
+                    <button type="button" class="btn btn-secondary" id="cancel-edit">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="facility-submit">
+                        {% if editing_pk %}Save Changes{% else %}Add Facility{% endif %}
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+{# -------------------------------- Upload data -------------------------------- #}
+<div class="tab-panel" id="panel-upload">
+    <div class="card">
+        <h2 style="margin-top:0">Manual Upload — All Facilities</h2>
+        <p style="margin-bottom:16px; color:#666; font-size:14px;">
+            Uploads every active facility for the selected date range.
+        </p>
+        <form method="post" action="{% url 'upload:multi_upload' %}" id="multi-upload-form">
+            {% csrf_token %}
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="{{ form.date_from.id_for_label }}">From Date</label>
+                    {{ form.date_from }}
+                </div>
+                <div class="form-group">
+                    <label for="{{ form.date_to.id_for_label }}">To Date</label>
+                    {{ form.date_to }}
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary" id="multi-upload-btn">Upload All Facilities</button>
+        </form>
+
+        <div class="progress-container" id="progress-container">
+            <div class="progress-bar-wrapper">
+                <div class="progress-bar" id="progress-bar" style="width: 0%">0%</div>
+            </div>
+            <div class="progress-status" id="progress-status">Starting upload...</div>
+            <div class="roll-up" id="roll-up" style="display:none">
+                <div><strong id="count-done">0</strong> done</div>
+                <div><strong id="count-failed">0</strong> failed</div>
+                <div><strong id="count-pending">0</strong> pending</div>
+                <div><strong id="count-records">0</strong> records</div>
+            </div>
+            <button type="button" class="expand-btn" id="toggle-detail" style="margin-top:10px; display:none">
+                Show per-facility detail
+            </button>
+            <div class="facility-progress" id="facility-progress" style="display:none"></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 style="margin-top:0">Upload History</h2>
+        {% if runs %}
+        <table>
+            <thead>
+                <tr>
+                    <th></th>
+                    <th>Date Range</th>
+                    <th>Trigger</th>
+                    <th>User</th>
+                    <th>Status</th>
+                    <th>Facilities</th>
+                    <th>Records</th>
+                    <th>Time</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for run in runs %}
+                <tr>
+                    <td><button type="button" class="expand-btn" data-run="{{ run.pk }}">&#9656;</button></td>
+                    <td>{{ run.date_from }} — {{ run.date_to }}</td>
+                    <td>
+                        <span class="badge {% if run.triggered_by == 'cron' %}badge-cron{% else %}badge-manual{% endif %}">
+                            {{ run.get_triggered_by_display }}
+                        </span>
+                    </td>
+                    <td>{{ run.triggered_by_user|default:"—" }}</td>
+                    <td>
+                        <span class="badge badge-{{ run.status }}">{{ run.get_status_display }}</span>
+                        {% if run.retry_of_id %}<span class="muted">retry</span>{% endif %}
+                    </td>
+                    <td>
+                        {{ run.facilities_completed }}/{{ run.facilities_total }}
+                        {% if run.facilities_failed %}
+                            <span class="muted">({{ run.facilities_failed }} failed)</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ run.records_uploaded }}</td>
+                    <td>{{ run.created_at|date:"Y-m-d H:i" }}</td>
+                    <td>
+                        {% if run.facilities_failed and not run.is_active %}
+                        <form method="post" action="{% url 'upload:run_retry_failed' run_id=run.pk %}"
+                              class="retry-form" style="display:inline">
+                            {% csrf_token %}
+                            <button type="submit" class="btn btn-secondary btn-sm">Retry failed</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                <tr class="detail-row" id="detail-{{ run.pk }}" style="display:none">
+                    <td colspan="9"><div class="muted" style="padding:12px 0">Loading…</div></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+            <div class="empty">No multi-facility uploads yet.</div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    const progressUrl = '{% url "upload:run_progress" run_id=0 %}';
+    const editUrl = '{% url "upload:facility_edit" pk=0 %}';
+    const addUrl = '{% url "upload:facility_add" %}';
+    const testUrl = '{% url "upload:facility_test" %}';
+    const csrf = document.querySelector('[name=csrfmiddlewaretoken]').value;
+
+    /* ------------------------------- tabs -------------------------------- */
+    const tabs = document.querySelectorAll('.tab');
+    function showPanel(name) {
+        tabs.forEach(function(t) { t.classList.toggle('active', t.dataset.panel === name); });
+        document.querySelectorAll('.tab-panel').forEach(function(p) {
+            p.classList.toggle('active', p.id === 'panel-' + name);
+        });
+    }
+    tabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+            showPanel(tab.dataset.panel);
+            history.replaceState(null, '', '#' + tab.dataset.panel);
+        });
+    });
+    if (location.hash === '#upload') { showPanel('upload'); }
+
+    /* --------------------------- facility modal --------------------------- */
+    const modal = document.getElementById('facility-modal');
+    const facilityForm = document.getElementById('facility-form');
+    const formTitle = document.getElementById('facility-form-title');
+    const submitBtn = document.getElementById('facility-submit');
+    const cancelBtn = document.getElementById('cancel-edit');
+    const closeBtn = document.getElementById('modal-close');
+    const passwordHelp = document.getElementById('password-help');
+    const testResult = document.getElementById('test-result');
+    // Non-empty when the server re-rendered this form after a failed edit, in
+    // which case the modal is already open and must stay pointed at that row.
+    let editingPk = facilityForm.dataset.editingPk || null;
+
+    function field(name) { return facilityForm.querySelector('[name="' + name + '"]'); }
+
+    function openModal() {
+        modal.classList.add('open');
+        document.body.style.overflow = 'hidden';
+        field('name').focus();
+    }
+
+    function closeModal() {
+        modal.classList.remove('open');
+        document.body.style.overflow = '';
+    }
+
+    document.getElementById('add-facility-btn').addEventListener('click', function() {
+        editingPk = null;
+        facilityForm.reset();
+        facilityForm.action = addUrl;
+        formTitle.textContent = 'Add Facility';
+        submitBtn.textContent = 'Add Facility';
+        passwordHelp.textContent = 'Stored encrypted.';
+        testResult.innerHTML = '';
+        openModal();
+    });
+
+    document.querySelectorAll('.edit-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            editingPk = btn.dataset.pk;
+            field('name').value = btn.dataset.name;
+            field('host').value = btn.dataset.host;
+            field('port').value = btn.dataset.port;
+            field('database_name').value = btn.dataset.database;
+            field('username').value = btn.dataset.username;
+            field('password').value = '';
+            field('is_active').checked = btn.dataset.active === '1';
+
+            facilityForm.action = editUrl.replace('/0/', '/' + editingPk + '/');
+            formTitle.textContent = 'Edit Facility';
+            submitBtn.textContent = 'Save Changes';
+            passwordHelp.textContent = 'Leave blank to keep the existing password.';
+            testResult.innerHTML = '';
+            openModal();
+        });
+    });
+
+    cancelBtn.addEventListener('click', closeModal);
+    closeBtn.addEventListener('click', closeModal);
+
+    modal.addEventListener('click', function(e) {
+        // Backdrop only: a click inside the dialog must not discard the form.
+        if (e.target === modal) { closeModal(); }
+    });
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && modal.classList.contains('open')) { closeModal(); }
+    });
+
+    if (modal.classList.contains('open')) {
+        // Server-rendered validation errors: lock the scroll the same way
+        // openModal() would, without stealing focus from the offending field.
+        document.body.style.overflow = 'hidden';
+    }
+
+    document.getElementById('test-btn').addEventListener('click', function() {
+        const body = new FormData(facilityForm);
+        if (editingPk) { body.append('pk', editingPk); }
+        testResult.innerHTML = '<div class="alert alert-info">Testing connection…</div>';
+
+        fetch(testUrl, {method: 'POST', body: body, headers: {'X-CSRFToken': csrf}})
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            const cls = data.ok ? 'alert-success' : 'alert-error';
+            let html = '<div class="alert ' + cls + '">' + escapeHtml(data.message) + '</div>';
+            if (data.candidates && data.candidates.length > 1) {
+                html += '<div class="help">Found: ' + data.candidates.map(function(c) {
+                    return escapeHtml((c.name || 'unnamed') + ' (MFL ' + (c.mfl || 'none') + ')');
+                }).join(', ') + '</div>';
+            }
+            testResult.innerHTML = html;
+        })
+        .catch(function(err) {
+            testResult.innerHTML = '<div class="alert alert-error">Test failed: ' + escapeHtml(String(err)) + '</div>';
+        });
+    });
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text == null ? '' : text;
+        return div.innerHTML;
+    }
+
+    /* ------------------------------ upload ------------------------------- */
+    const uploadForm = document.getElementById('multi-upload-form');
+    const uploadBtn = document.getElementById('multi-upload-btn');
+    const container = document.getElementById('progress-container');
+    const bar = document.getElementById('progress-bar');
+    const status = document.getElementById('progress-status');
+    const rollUp = document.getElementById('roll-up');
+    const detailToggle = document.getElementById('toggle-detail');
+    const detail = document.getElementById('facility-progress');
+
+    detailToggle.addEventListener('click', function() {
+        const open = detail.style.display !== 'none';
+        detail.style.display = open ? 'none' : 'block';
+        detailToggle.textContent = open ? 'Show per-facility detail' : 'Hide per-facility detail';
+    });
+
+    uploadForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+        uploadBtn.disabled = true;
+        uploadBtn.textContent = 'Uploading...';
+        container.style.display = 'block';
+        rollUp.style.display = 'flex';
+        detailToggle.style.display = 'inline-block';
+        bar.style.width = '0%';
+        bar.textContent = '0%';
+        bar.style.background = '#3498db';
+        status.textContent = 'Starting upload...';
+        status.className = 'progress-status';
+
+        fetch(uploadForm.action, {
+            method: 'POST',
+            body: new FormData(uploadForm),
+            headers: {'X-Requested-With': 'XMLHttpRequest'},
+        })
+        .then(function(resp) { return resp.json().then(function(d) { return {ok: resp.ok, data: d}; }); })
+        .then(function(result) {
+            if (!result.ok) {
+                finish(result.data.error || 'Could not start upload.', 'status-failed');
+                return;
+            }
+            poll(result.data.run_id);
+        })
+        .catch(function(err) { finish('Error starting upload: ' + err, 'status-failed'); });
+    });
+
+    function finish(message, cls) {
+        status.textContent = message;
+        status.className = 'progress-status ' + (cls || '');
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = 'Upload All Facilities';
+    }
+
+    function poll(runId) {
+        const url = progressUrl.replace('/0/', '/' + runId + '/');
+        const interval = setInterval(function() {
+            fetch(url)
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                render(data);
+                if (['success', 'partial', 'failed'].indexOf(data.status) === -1) { return; }
+
+                clearInterval(interval);
+                if (data.status === 'success') {
+                    bar.style.background = '#28a745';
+                    finish('Upload complete — ' + data.records_uploaded + ' records across ' +
+                           data.facilities_total + ' facilities.', 'status-success');
+                } else if (data.status === 'partial') {
+                    bar.style.background = '#f0ad4e';
+                    finish(data.facilities_failed + ' of ' + data.facilities_total +
+                           ' facilities failed. Use "Retry failed" below once the page reloads.', 'status-partial');
+                } else {
+                    bar.style.background = '#dc3545';
+                    finish('Upload failed: ' + (data.message || 'every facility failed.'), 'status-failed');
+                }
+                setTimeout(function() { location.hash = '#upload'; location.reload(); }, 2500);
+            })
+            .catch(function() {});
+        }, 2000);
+    }
+
+    function render(data) {
+        // Overall progress is facilities finished, not batches: batches are not
+        // comparable across facilities of wildly different sizes.
+        const total = data.facilities_total || 1;
+        const pct = Math.round((data.facilities_completed / total) * 100);
+        bar.style.width = pct + '%';
+        bar.textContent = pct + '%';
+
+        const done = data.facilities.filter(function(f) { return f.status === 'success'; }).length;
+        const failed = data.facilities.filter(function(f) { return f.status === 'failed'; }).length;
+        document.getElementById('count-done').textContent = done;
+        document.getElementById('count-failed').textContent = failed;
+        document.getElementById('count-pending').textContent = total - done - failed;
+        document.getElementById('count-records').textContent = data.records_uploaded;
+
+        if (data.status === 'in_progress') {
+            status.textContent = 'Uploading ' + data.facilities_completed + ' of ' + total + ' facilities…';
+        }
+        detail.innerHTML = data.facilities.map(facilityRow).join('');
+    }
+
+    function facilityRow(f) {
+        const pct = f.batches_total ? Math.round((f.batches_completed / f.batches_total) * 100)
+                                    : (f.status === 'success' ? 100 : 0);
+        return '<div class="facility-row status-' + f.status + '">' +
+            '<span class="name">' + escapeHtml(f.label) + '</span>' +
+            '<span class="mini-bar"><span style="width:' + pct + '%"></span></span>' +
+            '<span class="badge badge-' + f.status + '">' + f.status.replace('_', ' ') + '</span>' +
+            '<span class="muted">' + f.records_uploaded + ' rec</span>' +
+            (f.error_message ? '<span class="error-text" title="' + escapeHtml(f.error_message) + '">error</span>' : '') +
+            '</div>';
+    }
+
+    /* ------------------------- history expansion -------------------------- */
+    document.querySelectorAll('.expand-btn[data-run]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const runId = btn.dataset.run;
+            const row = document.getElementById('detail-' + runId);
+            const open = row.style.display !== 'none';
+            row.style.display = open ? 'none' : 'table-row';
+            btn.innerHTML = open ? '&#9656;' : '&#9662;';
+            if (open || row.dataset.loaded) { return; }
+
+            fetch(progressUrl.replace('/0/', '/' + runId + '/'))
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                row.dataset.loaded = '1';
+                row.querySelector('td').innerHTML =
+                    '<div class="facility-progress" style="display:block; max-height:none">' +
+                    data.facilities.map(facilityRow).join('') + '</div>';
+            });
+        });
+    });
+
+    document.querySelectorAll('.retry-form').forEach(function(form) {
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            fetch(form.action, {method: 'POST', body: new FormData(form)})
+            .then(function(resp) { return resp.json().then(function(d) { return {ok: resp.ok, data: d}; }); })
+            .then(function(result) {
+                if (!result.ok) { alert(result.data.error); return; }
+                showPanel('upload');
+                container.style.display = 'block';
+                rollUp.style.display = 'flex';
+                detailToggle.style.display = 'inline-block';
+                uploadBtn.disabled = true;
+                poll(result.data.run_id);
+            });
+        });
+    });
+})();
+</script>
+{% endblock %}

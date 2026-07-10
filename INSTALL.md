@@ -101,6 +101,55 @@ To check what the daily upload did, view its log:
 tail -n 100 /var/log/upload-appointments.log
 ```
 
+## Managing several KenyaEMR instances from one dashboard
+
+If this server should upload for many KenyaEMR containers rather than one, use
+the multi-facility dashboard. Log in as an administrator and open:
+
+- <http://127.0.0.1:9162/multi-facilities>
+
+### 1. Add each facility
+
+On the **Facility Setup** tab, add one entry per KenyaEMR container:
+
+| Field | What to enter |
+|---|---|
+| Facility Name | A label for your own reference. |
+| MySQL Host | The container name, hostname, or IP of its MySQL server. |
+| Port | Usually `3306`. Use the published port if containers share a host. |
+| Database Name | Usually `openmrs`. |
+| MySQL User | A user with **read access** to that database. |
+| MySQL Password | That user's password. Stored encrypted. |
+
+Click **Test Connection** before saving. It confirms the container is reachable
+and reports the MFL code the uploads will be tagged with. If two containers
+report the same MFL code, the second one is refused — the Ushauri DIFF platform
+identifies facilities by MFL, so they would overwrite each other's data.
+
+If the test reports that no default location is set, that container has no
+`kenyaemr.defaultLocation` configured and cannot be identified upstream. Fix it
+in KenyaEMR before adding it here.
+
+### 2. Turn on multi-facility mode
+
+Tick **Enable multi-facilities mode**. This tells the nightly job to upload every
+active facility in the list instead of the single facility configured at install
+time. Nothing else changes.
+
+### 3. Upload on demand
+
+On the **Upload Data** tab, pick a date range and click **Upload All Facilities**.
+Facilities are uploaded a few at a time, so a hundred of them takes roughly
+40 minutes rather than several hours. The progress bar tracks facilities
+finished; expand **Show per-facility detail** to watch individual facilities.
+
+A run that finishes with some facilities failed is marked **Partial**. Use the
+**Retry failed** button on that run in the history table to re-upload only those
+facilities, over the same date range.
+
+Only one upload may run at a time. Starting a second is refused while one is in
+flight.
+
 ## Updating the service
 
 To update to the latest version later, simply re-run the installer:
@@ -138,6 +187,20 @@ is using port 9162.
 Check `/var/log/upload-appointments.log`. The most common cause is incorrect
 OpenMRS database credentials — re-run the installer, choose `y` at the
 `Overwrite it? (y/N)` prompt, and re-enter the correct user and password.
+
+In multi-facility mode, use **Test Connection** on the facility instead: it
+reports exactly why a container is unreachable.
+
+**`Stored credential could not be decrypted`**
+The `FIELD_ENCRYPTION_KEY` in `/opt/upload-appointments/.env` changed, so the
+saved facility passwords can no longer be read. Re-enter the password for each
+affected facility on the Facility Setup tab. Never delete or regenerate that key
+on a server that has facilities configured.
+
+**An upload is stuck and blocks new ones**
+A run whose process was killed (for example by a server restart) is detected and
+marked failed automatically, about 20 minutes after it stopped making progress.
+Wait for that, then retry.
 
 **`Error: Please run this script as root (sudo).`**
 Run the installer with `sudo`, exactly as shown in step 2.

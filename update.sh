@@ -65,8 +65,10 @@ log "Updated $BEFORE -> $AFTER. Applying changes..."
 "$VENV_DIR/bin/python" "$APP_DIR/manage.py" collectstatic --noinput -v 0
 
 # git/pip/collectstatic ran as root; hand ownership back to the service user.
+# The glob also covers the WAL sidecar files (db.sqlite3-wal, -shm), which the
+# web process and the upload process both need to write.
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
-chmod 666 "$APP_DIR/db.sqlite3" 2>/dev/null || true
+chmod 666 "$APP_DIR"/db.sqlite3* 2>/dev/null || true
 
 # Restart so the long-running Gunicorn process picks up the new code. (The
 # upload_appointments cron command is a fresh process and picks it up on its
