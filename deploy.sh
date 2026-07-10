@@ -111,6 +111,23 @@ else
     configure_env=true
 fi
 
+# Read one key's value out of the current .env ('' when absent or blank).
+env_value() { grep -s "^$1=" "$ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true; }
+
+# Write a key only when it has no value yet, so re-running the installer never
+# rotates one. FIELD_ENCRYPTION_KEY decrypts the facility MySQL passwords held in
+# db.sqlite3 and DJANGO_SECRET_KEY backs existing sessions: regenerating either
+# would silently break a working install.
+ensure_env_key() {
+    local key="$1" value="$2"
+    if [[ -n "$(env_value "$key")" ]]; then
+        return 0
+    fi
+    sed -i "/^${key}=/d" "$ENV_FILE" 2>/dev/null || true   # drop a blank placeholder
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+    echo "  Added $key to $ENV_FILE"
+}
+
 if [[ "$configure_env" == "true" ]]; then
     echo "  Configuring environment variables..."
     echo
@@ -118,15 +135,9 @@ if [[ "$configure_env" == "true" ]]; then
     prompt db_user     "  OpenMRS DB User: "
     prompt db_password "  OpenMRS DB Password: "
 
-    # These two must survive a re-install. FIELD_ENCRYPTION_KEY decrypts the
-    # facility MySQL passwords stored in db.sqlite3, and DJANGO_SECRET_KEY backs
-    # existing sessions — regenerating either would silently break a working
-    # multi-facility install. Reuse whatever the old .env had.
-    existing_key() { grep -s "^$1=" "$ENV_FILE" | head -n1 | cut -d= -f2- || true; }
-    FIELD_ENCRYPTION_KEY="$(existing_key FIELD_ENCRYPTION_KEY)"
-    FIELD_ENCRYPTION_KEY="${FIELD_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
-    DJANGO_SECRET_KEY="$(existing_key DJANGO_SECRET_KEY)"
-    DJANGO_SECRET_KEY="${DJANGO_SECRET_KEY:-$(openssl rand -hex 32)}"
+    # Captured before the heredoc truncates the file.
+    OLD_SECRET_KEY="$(env_value DJANGO_SECRET_KEY)"
+    OLD_ENCRYPTION_KEY="$(env_value FIELD_ENCRYPTION_KEY)"
 
     cat > "$ENV_FILE" <<ENVEOF
 OPENMRS_DB_NAME=${DB_NAME}
@@ -137,15 +148,23 @@ OPENMRS_DB_PORT=${DB_PORT}
 CHQI_API_BASE_URL=${API_BASE_URL}
 CHQI_API_USERNAME=${CHQI_API_USERNAME}
 CHQI_API_PASSWORD=${CHQI_API_PASSWORD}
-DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-FIELD_ENCRYPTION_KEY=${FIELD_ENCRYPTION_KEY}
-DJANGO_DEBUG=False
-DJANGO_ALLOWED_HOSTS=*
 ENVEOF
 
-    chmod 640 "$ENV_FILE"
+    ensure_env_key DJANGO_SECRET_KEY    "${OLD_SECRET_KEY:-$(openssl rand -hex 32)}"
+    ensure_env_key FIELD_ENCRYPTION_KEY "${OLD_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
     echo "  .env saved."
 fi
+
+# Runs on both paths. An install upgraded from a single-facility version keeps its
+# existing .env ("Overwrite it? N") and would otherwise never gain these keys —
+# leaving facility passwords encrypted with the SECRET_KEY fallback, which is a
+# literal committed to the repository.
+touch "$ENV_FILE"
+ensure_env_key DJANGO_SECRET_KEY     "$(openssl rand -hex 32)"
+ensure_env_key FIELD_ENCRYPTION_KEY  "$(openssl rand -hex 32)"
+ensure_env_key DJANGO_DEBUG          "False"
+ensure_env_key DJANGO_ALLOWED_HOSTS  "*"
+chmod 640 "$ENV_FILE"
 
 # --- Run migrations ---
 echo "[5/9] Running database migrations..."
