@@ -27,6 +27,15 @@ The flag only controls what the nightly cron job uploads. Manual uploads work in
 ## Architecture Notes
 
 - **OpenMRS is not a Django database alias.** Facilities are separate containers, so `upload/openmrs.py` opens a raw `MySQLdb` connection per facility. The appointment SQL uses unqualified table names; the connected database supplies the schema. Do not reintroduce an `openmrs` entry in `DATABASES`.
+- **The first run after install is a backfill.** A fresh deployment has nothing
+  upstream, so instead of one night's window it uploads every pending appointment
+  (`AppointmentQuery` minus the `date_appointment_scheduled` filter). Whichever
+  comes first — the operator pressing "Upload all pending now" or the next cron
+  firing — flips `AppSettings.initial_backfill_done`, and it never happens again
+  unless forced with `--backfill`. Nightly runs filter on
+  `date_appointment_scheduled`, i.e. when the appointment was booked, not when it
+  falls; an explicitly requested date range always suppresses the automatic
+  backfill.
 - **A run is the unit of work.** `UploadRun` has one `UploadLog` per target facility, created up front. Single-facility runs have exactly one log with `facility = NULL`, which is also how logs predating multi-facility support read. Run status is `success` / `partial` / `failed` — with 100 facilities, "a few failed" is the normal case, hence `partial` and the retry-failed action.
 - **Uploads run in a detached subprocess**, not a thread inside gunicorn: a 100-facility run takes tens of minutes and must survive a worker restart. The web view creates the run, then spawns `manage.py upload_appointments --run-id=N`. Cron uses the same code path. A run whose heartbeat goes cold for `UPLOAD_STALE_MINUTES` is marked failed by `mark_stale_runs()`.
 - **Facilities upload concurrently** via a `ThreadPoolExecutor` sized by `MULTI_FACILITY_WORKERS`. The central API is the only shared bottleneck; each facility has its own MySQL.
@@ -127,4 +136,18 @@ python manage.py upload_appointments --facility 7 --date-from 2026-01-01 --date-
 
 # Override concurrency for one run
 python manage.py upload_appointments --workers 2
+
+# Force another full upload of every pending appointment. The first cron job
+# after install does this by itself; this is for repeating it deliberately.
+# Refuses to combine with a date range.
+python manage.py upload_appointments --backfill
 ```
+
+A backfill run stores `date_from`/`date_to` as the day it ran and sets
+`is_backfill`; the UI shows "All pending" for those rather than a date range.
+Facilities that succeed get `Facility.initial_backfill_at` stamped, so the
+"Initial Load" column shows exactly which containers still need one. The
+deployment-wide flag is set even when a backfill ends `partial` — at a hundred
+facilities a few are always unreachable, and repeating a full-history upload for
+the rest every night to chase them would be worse than leaving them to the
+"Retry failed" button, which re-runs the backfill for just those facilities.

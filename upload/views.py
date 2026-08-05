@@ -24,6 +24,8 @@ def _serialize_run(run):
         'run_id': run.pk,
         'status': run.status,
         'mode': run.mode,
+        'is_backfill': run.is_backfill,
+        'period_label': run.period_label,
         'date_from': run.date_from.isoformat(),
         'date_to': run.date_to.isoformat(),
         'facilities_total': run.facilities_total,
@@ -46,7 +48,8 @@ def _serialize_run(run):
     }
 
 
-def _start_run(request, mode, dates=None, facilities=None, retry_of=None):
+def _start_run(request, mode, dates=None, facilities=None, retry_of=None,
+               is_backfill=False):
     """Create a run and hand it to a detached process, refusing to overlap.
 
     `dates` short-circuits form validation for retries, which reuse the original
@@ -72,10 +75,15 @@ def _start_run(request, mode, dates=None, facilities=None, retry_of=None):
             )
 
     if dates is None:
-        form = UploadForm(request.POST)
-        if not form.is_valid():
-            return JsonResponse({'error': form.errors.as_text()}, status=400)
-        dates = (form.cleaned_data['date_from'], form.cleaned_data['date_to'])
+        if is_backfill:
+            # A backfill has no window; the stored dates just record when it ran.
+            today = timezone.localdate()
+            dates = (today, today)
+        else:
+            form = UploadForm(request.POST)
+            if not form.is_valid():
+                return JsonResponse({'error': form.errors.as_text()}, status=400)
+            dates = (form.cleaned_data['date_from'], form.cleaned_data['date_to'])
 
     run = services.create_run(
         date_from=dates[0],
@@ -85,6 +93,7 @@ def _start_run(request, mode, dates=None, facilities=None, retry_of=None):
         mode=mode,
         facilities=facilities,
         retry_of=retry_of,
+        is_backfill=is_backfill,
     )
     services.spawn_run(run.pk)
     return JsonResponse({'run_id': run.pk})
@@ -102,10 +111,12 @@ def upload_view(request):
     logs = sorted(
         list(logs) + list(legacy), key=lambda log: log.created_at, reverse=True,
     )[:50]
+    app_settings = AppSettings.load()
     return render(request, 'upload/upload.html', {
         'form': UploadForm(),
         'logs': logs,
-        'multi_enabled': AppSettings.load().multi_facility_enabled,
+        'multi_enabled': app_settings.multi_facility_enabled,
+        'settings_obj': app_settings,
     })
 
 
@@ -127,13 +138,17 @@ def run_progress(request, run_id):
 @staff_required
 def multi_facilities(request):
     services.mark_stale_runs()
+    facilities = Facility.objects.all()
     return render(request, 'upload/multi_facilities.html', {
         'form': UploadForm(),
         'facility_form': FacilityForm(),
-        'facilities': Facility.objects.all(),
+        'facilities': facilities,
         'runs': UploadRun.objects.filter(mode='multi')[:50],
         'settings_obj': AppSettings.load(),
         'active_run': services.active_run(),
+        'backfill_pending_count': sum(
+            1 for f in facilities if f.is_active and f.initial_backfill_at is None
+        ),
     })
 
 
@@ -149,14 +164,18 @@ def facility_save(request, pk=None):
 
     # Re-render with errors rather than silently dropping the submission.
     services.mark_stale_runs()
+    facilities = Facility.objects.all()
     return render(request, 'upload/multi_facilities.html', {
         'form': UploadForm(),
         'facility_form': form,
         'editing_pk': pk,
-        'facilities': Facility.objects.all(),
+        'facilities': facilities,
         'runs': UploadRun.objects.filter(mode='multi')[:50],
         'settings_obj': AppSettings.load(),
         'active_run': services.active_run(),
+        'backfill_pending_count': sum(
+            1 for f in facilities if f.is_active and f.initial_backfill_at is None
+        ),
     }, status=400)
 
 
@@ -238,6 +257,22 @@ def multi_upload(request):
 
 
 @login_required
+@require_POST
+def backfill_upload(request):
+    """Run the one-off initial upload of every pending appointment.
+
+    Normally the next cron job does this by itself; the button exists so a fresh
+    install can be loaded immediately after setup instead of waiting for 6am.
+    Re-running it once it has happened is allowed — it uploads the same records
+    again, which the platform appends, but that is the operator's call to make.
+    """
+    mode = 'multi' if AppSettings.load().multi_facility_enabled else 'single'
+    if mode == 'multi' and not request.user.is_staff:
+        return JsonResponse({'error': 'Forbidden'}, status=403)
+    return _start_run(request, mode=mode, is_backfill=True)
+
+
+@login_required
 @staff_required
 @require_POST
 def run_retry_failed(request, run_id):
@@ -258,4 +293,7 @@ def run_retry_failed(request, run_id):
         dates=(run.date_from, run.date_to),
         facilities=facilities,
         retry_of=run,
+        # Retrying a backfill must re-run the backfill: the stored dates are the
+        # day it ran, not a window worth re-querying.
+        is_backfill=run.is_backfill,
     )

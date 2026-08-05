@@ -16,7 +16,7 @@ from django.db.models import F, Q, Sum
 from django.utils import timezone
 
 from . import openmrs
-from .models import Facility, UploadLog, UploadRun
+from .models import AppSettings, Facility, UploadLog, UploadRun
 
 logger = logging.getLogger(__name__)
 
@@ -238,16 +238,25 @@ def upload_patients(patients, tokens, log=None, batch_size=None, max_retries=4,
     return results
 
 
-def upload_facility(log, config, tokens):
-    """Query one facility and upload its appointments, recording the outcome on `log`."""
+def upload_facility(log, config, tokens, backfill=False):
+    """Query one facility and upload its appointments, recording the outcome on `log`.
+
+    `backfill` drops the date window and sends every pending appointment — the
+    one-off initial load. On success it stamps the facility, so a run that leaves
+    a few containers behind shows exactly which ones still need it.
+    """
     log.status = 'in_progress'
     log.started_at = timezone.now()
     log.error_message = ''
     log.save(update_fields=['status', 'started_at', 'error_message'])
 
+    period = 'all pending' if backfill else '{} to {}'.format(log.date_from, log.date_to)
     try:
         with openmrs.connect(config) as conn:
-            patients = openmrs.fetch_appointments(conn, log.date_from, log.date_to)
+            if backfill:
+                patients = openmrs.fetch_appointments(conn)
+            else:
+                patients = openmrs.fetch_appointments(conn, log.date_from, log.date_to)
 
         log.records_uploaded = len(patients)
         log.save(update_fields=['records_uploaded'])
@@ -258,13 +267,17 @@ def upload_facility(log, config, tokens):
             log.error_message = 'No records found for the given period.'
 
         log.status = 'success'
-        logger.info("Upload successful for %s: %d records for %s to %s",
-                    config.label, len(patients), log.date_from, log.date_to)
+        if backfill and log.facility_id:
+            Facility.objects.filter(pk=log.facility_id).update(
+                initial_backfill_at=timezone.now(),
+            )
+        logger.info("Upload successful for %s: %d records for %s",
+                    config.label, len(patients), period)
     except Exception:
         log.error_message = traceback.format_exc()
         log.status = 'failed'
-        logger.error("Upload failed for %s (%s to %s): %s",
-                     config.label, log.date_from, log.date_to, log.error_message)
+        logger.error("Upload failed for %s (%s): %s",
+                     config.label, period, log.error_message)
 
     log.finished_at = timezone.now()
     log.save(update_fields=['status', 'error_message', 'finished_at'])
@@ -272,7 +285,7 @@ def upload_facility(log, config, tokens):
 
 
 def create_run(date_from, date_to, triggered_by, user=None, mode='single',
-               facilities=None, retry_of=None):
+               facilities=None, retry_of=None, is_backfill=False):
     """Create an UploadRun and one pending UploadLog per target facility.
 
     Materialising the child logs up front is what makes the progress endpoint and
@@ -289,6 +302,7 @@ def create_run(date_from, date_to, triggered_by, user=None, mode='single',
     run = UploadRun.objects.create(
         date_from=date_from,
         date_to=date_to,
+        is_backfill=is_backfill,
         mode=mode,
         triggered_by=triggered_by,
         triggered_by_user=user,
@@ -324,14 +338,51 @@ def _heartbeat_loop(run_pk, stop_event, interval=30):
         connections.close_all()
 
 
-def _facility_worker(log_pk, config, tokens):
+def _facility_worker(log_pk, config, tokens, backfill=False):
     """Run one facility in its own thread, closing that thread's DB connections."""
     from django.db import connections
     try:
         log = UploadLog.objects.get(pk=log_pk)
-        return upload_facility(log, config, tokens)
+        return upload_facility(log, config, tokens, backfill=backfill)
     finally:
         connections.close_all()
+
+
+def _record_backfill_done(run):
+    """Mark the deployment's one-off initial load as having happened.
+
+    Deliberately also on a `partial` run: at a hundred facilities a couple are
+    always unreachable, and repeating a full-history upload for the other
+    ninety-eight every night to chase them would be worse than leaving them to
+    the retry button, which re-runs the backfill for exactly those facilities.
+    """
+    app_settings = AppSettings.load()
+    if app_settings.initial_backfill_done:
+        return
+
+    # Only a run that covered every active facility counts as *the* initial load.
+    # `--facility 7` and "retry failed" are backfills too, and neither says
+    # anything about the ninety-nine containers they didn't touch.
+    if run.mode == 'multi':
+        active = set(Facility.objects.filter(is_active=True).values_list('pk', flat=True))
+        covered = set(
+            run.logs.exclude(facility__isnull=True).values_list('facility_id', flat=True)
+        )
+        if not active.issubset(covered):
+            logger.info(
+                'Backfill run %s covered %d of %d active facilities; leaving the '
+                'initial load flag unset.', run.pk, len(covered & active), len(active),
+            )
+            return
+    app_settings.initial_backfill_done = True
+    app_settings.initial_backfill_at = timezone.now()
+    app_settings.initial_backfill_run = run
+    app_settings.save(update_fields=[
+        'initial_backfill_done', 'initial_backfill_at', 'initial_backfill_run',
+        'updated_at',
+    ])
+    logger.info('Initial backfill recorded as complete (run %s, %s).',
+                run.pk, run.status)
 
 
 def _finalize_run(run):
@@ -358,6 +409,8 @@ def _finalize_run(run):
         'status', 'facilities_completed', 'facilities_failed',
         'records_uploaded', 'finished_at',
     ])
+    if run.is_backfill and status in ('success', 'partial'):
+        _record_backfill_done(run)
     return run
 
 
@@ -401,14 +454,15 @@ def execute_run(run, workers=None):
         try:
             if worker_count == 1:
                 for log, config in targets:
-                    upload_facility(log, config, tokens)
+                    upload_facility(log, config, tokens, backfill=run.is_backfill)
                     _record_facility_done(run.pk)
             else:
                 logger.info('Uploading %d facilities with %d workers.',
                             len(targets), worker_count)
                 with ThreadPoolExecutor(max_workers=worker_count) as pool:
                     futures = {
-                        pool.submit(_facility_worker, log.pk, config, tokens): log
+                        pool.submit(_facility_worker, log.pk, config, tokens,
+                                    run.is_backfill): log
                         for log, config in targets
                     }
                     for future in as_completed(futures):

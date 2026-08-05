@@ -4,6 +4,8 @@ from unittest import mock
 
 import requests
 from django.contrib.auth.models import User
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -522,6 +524,47 @@ class ViewTests(TestCase):
         mock_spawn.assert_called_once()
 
     @mock.patch('upload.services.spawn_run')
+    def test_backfill_button_starts_a_backfill_without_asking_for_dates(self, mock_spawn):
+        self.client.force_login(self.plain)
+        response = self.client.post(reverse('upload:backfill_upload'))
+
+        self.assertEqual(response.status_code, 200)
+        run = UploadRun.objects.get(pk=response.json()['run_id'])
+        self.assertTrue(run.is_backfill)
+        self.assertEqual(run.mode, 'single')
+        self.assertEqual(run.triggered_by, 'manual')
+        mock_spawn.assert_called_once()
+
+    @mock.patch('upload.services.spawn_run')
+    def test_backfill_in_multi_mode_is_staff_only(self, mock_spawn):
+        AppSettings.objects.update_or_create(pk=1, defaults={'multi_facility_enabled': True})
+        self.client.force_login(self.plain)
+
+        response = self.client.post(reverse('upload:backfill_upload'))
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(UploadRun.objects.exists())
+        mock_spawn.assert_not_called()
+
+    @mock.patch('upload.services.spawn_run')
+    def test_retrying_a_backfill_stays_a_backfill(self, mock_spawn):
+        kilifi = Facility.objects.create(name='Kilifi', host='k', username='u',
+                                         password_encrypted='x')
+        run = services.create_run(date(2026, 8, 5), date(2026, 8, 5), triggered_by='cron',
+                                  mode='multi', facilities=[kilifi], is_backfill=True)
+        run.logs.update(status='failed')
+        UploadRun.objects.filter(pk=run.pk).update(status='partial', facilities_failed=1)
+
+        self.client.force_login(self.staff)
+        response = self.client.post(
+            reverse('upload:run_retry_failed', kwargs={'run_id': run.pk}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        retry = UploadRun.objects.get(pk=response.json()['run_id'])
+        self.assertTrue(retry.is_backfill)
+
+    @mock.patch('upload.services.spawn_run')
     def test_multi_upload_without_facilities_is_rejected(self, mock_spawn):
         self.client.force_login(self.staff)
         response = self.client.post(reverse('upload:multi_upload'),
@@ -670,7 +713,7 @@ class ExecuteRunTests(TestCase):
                                   triggered_by='cron', mode='multi')
 
         with mock.patch('upload.services.upload_facility') as mock_upload:
-            mock_upload.side_effect = lambda log, config, tokens: (
+            mock_upload.side_effect = lambda log, config, tokens, backfill=False: (
                 UploadLog.objects.filter(pk=log.pk).update(status='success')
             )
             services.execute_run(run, workers=1)
@@ -691,6 +734,207 @@ class ExecuteRunTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, 'failed')
         self.assertIn('No active facilities', run.message)
+
+
+class FetchAppointmentsQueryTests(SimpleTestCase):
+    """Which of the two query variants runs, and with which parameters."""
+
+    class Cursor:
+        description = [('patient_id',), ('appointment_type',)]
+
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+        def fetchall(self):
+            return ()
+
+        def close(self):
+            pass
+
+    def _fetch(self, *args):
+        cursor = self.Cursor()
+        conn = mock.Mock()
+        conn.cursor.return_value = cursor
+        openmrs.fetch_appointments(conn, *args)
+        return cursor.executed[0]
+
+    def test_a_date_range_filters_on_when_the_appointment_was_booked(self):
+        sql, params = self._fetch(date(2026, 1, 1), date(2026, 1, 2))
+        self.assertIn('date_appointment_scheduled between', sql)
+        self.assertEqual(params, ['2026-01-01', '2026-01-02'])
+
+    def test_no_dates_runs_the_unfiltered_backfill_query(self):
+        sql, params = self._fetch()
+        self.assertNotIn('date_appointment_scheduled between', sql)
+        self.assertIsNone(params)
+
+    def test_both_variants_keep_the_consent_and_pending_filters(self):
+        for sql in (openmrs.APPOINTMENT_QUERY, openmrs.APPOINTMENT_BACKFILL_QUERY):
+            self.assertIn("data.consented='Yes'", sql)
+            self.assertIn("x.start_date_time > now()", sql)
+            self.assertIn("x.status != 'Cancelled'", sql)
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility')
+class BackfillRunTests(TestCase):
+    """The one-off initial load: when it runs, and when it counts as done."""
+
+    def _facility(self, name):
+        facility = Facility.objects.create(name=name, host=name, username='u')
+        facility.set_password('pw')
+        facility.save()
+        return facility
+
+    def _backfill_run(self, facilities, statuses, mode='multi'):
+        run = services.create_run(
+            date(2026, 8, 5), date(2026, 8, 5), triggered_by='cron', mode=mode,
+            facilities=facilities, is_backfill=True,
+        )
+        for log, status in zip(run.logs.order_by('pk'), statuses):
+            UploadLog.objects.filter(pk=log.pk).update(status=status)
+        return run
+
+    def test_a_completed_backfill_marks_the_deployment_done(self):
+        facilities = [self._facility('Kilifi'), self._facility('Malindi')]
+        run = self._backfill_run(facilities, ['success', 'success'])
+
+        services._finalize_run(run)
+
+        app_settings = AppSettings.load()
+        self.assertTrue(app_settings.initial_backfill_done)
+        self.assertEqual(app_settings.initial_backfill_run_id, run.pk)
+        self.assertIsNotNone(app_settings.initial_backfill_at)
+
+    def test_a_partial_backfill_still_counts(self):
+        # Three unreachable containers out of a hundred is the normal case;
+        # re-uploading full history nightly to chase them would be worse.
+        facilities = [self._facility('Kilifi'), self._facility('Malindi')]
+        run = self._backfill_run(facilities, ['success', 'failed'])
+
+        services._finalize_run(run)
+
+        self.assertTrue(AppSettings.load().initial_backfill_done)
+
+    def test_a_backfill_of_one_facility_does_not_mark_the_deployment_done(self):
+        kilifi = self._facility('Kilifi')
+        self._facility('Malindi')
+        run = self._backfill_run([kilifi], ['success'])
+
+        services._finalize_run(run)
+
+        self.assertFalse(AppSettings.load().initial_backfill_done)
+
+    def test_a_failed_backfill_does_not_mark_the_deployment_done(self):
+        facilities = [self._facility('Kilifi')]
+        run = self._backfill_run(facilities, ['failed'])
+
+        services._finalize_run(run)
+
+        self.assertFalse(AppSettings.load().initial_backfill_done)
+
+    def test_a_dated_run_never_touches_the_flag(self):
+        facilities = [self._facility('Kilifi')]
+        run = services.create_run(date(2026, 1, 1), date(2026, 1, 2),
+                                  triggered_by='cron', mode='multi', facilities=facilities)
+        run.logs.update(status='success')
+
+        services._finalize_run(run)
+
+        self.assertFalse(AppSettings.load().initial_backfill_done)
+
+    def test_uploading_a_facility_in_backfill_mode_drops_the_dates_and_stamps_it(self):
+        facility = self._facility('Kilifi')
+        run = self._backfill_run([facility], ['pending'])
+        log = run.logs.get()
+
+        @contextmanager
+        def fake_connect(config):
+            yield mock.Mock()
+
+        with mock.patch.object(openmrs, 'connect', fake_connect), \
+                mock.patch.object(openmrs, 'fetch_appointments', return_value=[]) as fetch:
+            services.upload_facility(log, facility.as_config(), mock.Mock(), backfill=True)
+
+        # No date arguments at all — the backfill query takes none.
+        self.assertEqual(fetch.call_args[0][1:], ())
+        facility.refresh_from_db()
+        self.assertIsNotNone(facility.initial_backfill_at)
+
+    def test_a_dated_upload_leaves_the_facility_stamp_alone(self):
+        facility = self._facility('Kilifi')
+        run = services.create_run(date(2026, 1, 1), date(2026, 1, 2),
+                                  triggered_by='cron', mode='multi', facilities=[facility])
+        log = run.logs.get()
+
+        @contextmanager
+        def fake_connect(config):
+            yield mock.Mock()
+
+        with mock.patch.object(openmrs, 'connect', fake_connect), \
+                mock.patch.object(openmrs, 'fetch_appointments', return_value=[]) as fetch:
+            services.upload_facility(log, facility.as_config(), mock.Mock())
+
+        self.assertEqual(fetch.call_args[0][1:], (log.date_from, log.date_to))
+        facility.refresh_from_db()
+        self.assertIsNone(facility.initial_backfill_at)
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility')
+class UploadCommandBackfillTests(TestCase):
+    """What the nightly cron job decides to upload."""
+
+    def setUp(self):
+        patcher = mock.patch('upload.services.execute_run', side_effect=self._succeed)
+        self.execute = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _succeed(run, workers=None):
+        # Stand in for the real upload, so _report() sees a finished run rather
+        # than a pending one and does not exit(1).
+        UploadRun.objects.filter(pk=run.pk).update(status='success')
+        return run
+
+    def _run(self, **kwargs):
+        call_command('upload_appointments', **kwargs)
+        return UploadRun.objects.latest('pk')
+
+    def test_the_first_cron_job_uploads_everything_pending(self):
+        run = self._run()
+        self.assertTrue(run.is_backfill)
+        self.assertEqual(run.period_label, 'All pending appointments')
+
+    def test_later_cron_jobs_upload_the_nightly_window(self):
+        AppSettings.objects.update_or_create(pk=1, defaults={'initial_backfill_done': True})
+
+        run = self._run()
+
+        self.assertFalse(run.is_backfill)
+        self.assertEqual(run.date_to, date.today())
+        self.assertEqual(run.date_from, date.today() - timedelta(days=1))
+
+    def test_an_explicit_date_range_is_never_turned_into_a_backfill(self):
+        # The flag is unset, but someone asking for specific dates means them.
+        run = self._run(date_from='2026-01-01', date_to='2026-01-02')
+
+        self.assertFalse(run.is_backfill)
+        self.assertEqual(run.date_from, date(2026, 1, 1))
+
+    def test_backfill_can_be_forced_after_it_has_already_happened(self):
+        AppSettings.objects.update_or_create(pk=1, defaults={'initial_backfill_done': True})
+
+        run = self._run(backfill=True)
+
+        self.assertTrue(run.is_backfill)
+
+    def test_backfill_with_a_date_range_is_refused(self):
+        with self.assertRaises(CommandError) as ctx:
+            call_command('upload_appointments', backfill=True, date_from='2026-01-01')
+        self.assertIn('one or the other', str(ctx.exception))
+        self.assertFalse(UploadRun.objects.exists())
 
 
 class AppSettingsTests(TestCase):

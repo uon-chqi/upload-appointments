@@ -12,6 +12,46 @@
     {% endif %}
 
     <div class="card">
+        <div class="card-header">
+            <h2>Initial Upload</h2>
+            {% if settings_obj.initial_backfill_done %}
+                <span class="badge badge-success">Done</span>
+            {% else %}
+                <span class="badge badge-pending">Not yet run</span>
+            {% endif %}
+        </div>
+        {% if settings_obj.initial_backfill_done %}
+            <p style="color:#666; font-size:14px;">
+                All pending appointments were uploaded on
+                <strong>{{ settings_obj.initial_backfill_at|date:"Y-m-d H:i" }}</strong>.
+                Nightly runs now upload only what was booked that day.
+            </p>
+        {% else %}
+            <p style="color:#666; font-size:14px;">
+                Existing pending appointments have not been uploaded yet. The next
+                nightly cron job will do it automatically; use the button to do it
+                now instead. Every pending appointment is sent, whenever it was
+                booked — this takes longer than a nightly run.
+            </p>
+        {% endif %}
+        {% if multi_enabled %}
+            <p class="help" style="margin-bottom:12px">
+                Multi-facility mode is on, so the initial upload covers every active
+                facility, exactly as the nightly job does.
+            </p>
+        {% endif %}
+        {% if not multi_enabled or user.is_staff %}
+        <form method="post" action="{% url 'upload:backfill_upload' %}" id="backfill-form">
+            {% csrf_token %}
+            <button type="submit" class="btn {% if settings_obj.initial_backfill_done %}btn-secondary{% else %}btn-primary{% endif %}"
+                    id="backfill-btn">
+                {% if settings_obj.initial_backfill_done %}Run it again{% else %}Upload all pending now{% endif %}
+            </button>
+        </form>
+        {% endif %}
+    </div>
+
+    <div class="card">
         <h2 style="margin-top:0">Manual Upload</h2>
         <p style="margin-bottom:16px; color:#666; font-size:14px;">
             Select a date range and upload appointment data to Ushauri DIFF platform.
@@ -56,7 +96,13 @@
                 <tbody>
                     {% for log in logs %}
                     <tr>
-                        <td>{{ log.date_from }} — {{ log.date_to }}</td>
+                        <td>
+                            {% if log.run.is_backfill %}
+                                <span class="badge badge-cron">All pending</span>
+                            {% else %}
+                                {{ log.date_from }} — {{ log.date_to }}
+                            {% endif %}
+                        </td>
                         <td>
                             <span class="badge {% if log.triggered_by == 'cron' %}badge-cron{% else %}badge-manual{% endif %}">
                                 {{ log.get_triggered_by_display }}
@@ -97,42 +143,64 @@
     const progressStatus = document.getElementById('progress-status');
     const progressUrl = '{% url "upload:run_progress" run_id=0 %}';
 
+    // The dated upload and the initial backfill share one progress panel; only
+    // the button that started the run is re-enabled when it ends.
+    let activeBtn = btn;
+    let activeLabel = btn.textContent;
+
     function reset(message, cls) {
         progressStatus.textContent = message;
         progressStatus.className = 'progress-status ' + (cls || '');
-        btn.disabled = false;
-        btn.textContent = 'Upload Now';
+        activeBtn.disabled = false;
+        activeBtn.textContent = activeLabel;
     }
 
-    form.addEventListener('submit', function(e) {
-        e.preventDefault();
+    function submitUpload(theForm, theBtn, confirmMessage) {
+        return function(e) {
+            e.preventDefault();
+            if (confirmMessage && !confirm(confirmMessage)) { return; }
 
-        btn.disabled = true;
-        btn.textContent = 'Uploading...';
-        progressContainer.style.display = 'block';
-        progressBar.style.width = '0%';
-        progressBar.textContent = '0%';
-        progressBar.style.background = '#3498db';
-        progressStatus.textContent = 'Starting upload...';
-        progressStatus.className = 'progress-status';
+            activeBtn = theBtn;
+            activeLabel = theBtn.textContent;
+            theBtn.disabled = true;
+            theBtn.textContent = 'Uploading...';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+            progressBar.style.background = '#3498db';
+            progressStatus.textContent = 'Starting upload...';
+            progressStatus.className = 'progress-status';
+            progressContainer.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 
-        fetch(form.action || window.location.href, {
-            method: 'POST',
-            body: new FormData(form),
-            headers: {'X-Requested-With': 'XMLHttpRequest'},
-        })
-        .then(function(resp) { return resp.json().then(function(data) { return {ok: resp.ok, data: data}; }); })
-        .then(function(result) {
-            if (!result.ok) {
-                reset(result.data.error || 'Could not start upload.', 'status-failed');
-                return;
-            }
-            pollProgress(result.data.run_id);
-        })
-        .catch(function(err) {
-            reset('Error starting upload: ' + err, 'status-failed');
-        });
-    });
+            fetch(theForm.action || window.location.href, {
+                method: 'POST',
+                body: new FormData(theForm),
+                headers: {'X-Requested-With': 'XMLHttpRequest'},
+            })
+            .then(function(resp) { return resp.json().then(function(data) { return {ok: resp.ok, data: data}; }); })
+            .then(function(result) {
+                if (!result.ok) {
+                    reset(result.data.error || 'Could not start upload.', 'status-failed');
+                    return;
+                }
+                pollProgress(result.data.run_id);
+            })
+            .catch(function(err) {
+                reset('Error starting upload: ' + err, 'status-failed');
+            });
+        };
+    }
+
+    form.addEventListener('submit', submitUpload(form, btn));
+
+    const backfillForm = document.getElementById('backfill-form');
+    if (backfillForm) {
+        backfillForm.addEventListener('submit', submitUpload(
+            backfillForm,
+            document.getElementById('backfill-btn'),
+            'Upload every pending appointment? This takes longer than a normal upload.'
+        ));
+    }
 
     function pollProgress(runId) {
         const url = progressUrl.replace('/0/', '/' + runId + '/');

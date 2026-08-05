@@ -38,6 +38,13 @@ class Command(BaseCommand):
             type=int,
             help='Override the number of facilities uploaded concurrently.',
         )
+        parser.add_argument(
+            '--backfill',
+            action='store_true',
+            help='Upload every pending appointment, ignoring the date range. '
+                 'Runs automatically on the first cron job after install; this '
+                 'forces another one.',
+        )
 
     def handle(self, *args, **options):
         services.mark_stale_runs()
@@ -48,8 +55,8 @@ class Command(BaseCommand):
             run = self._create_run(options)
 
         self.stdout.write(
-            'Uploading {} facility(ies) from {} to {}...'.format(
-                run.facilities_total, run.date_from, run.date_to,
+            'Uploading {} facility(ies) — {}...'.format(
+                run.facilities_total, run.period_label.lower(),
             )
         )
         services.execute_run(run, workers=options.get('workers'))
@@ -92,6 +99,27 @@ class Command(BaseCommand):
         if date_from > date_to:
             raise CommandError("--date-from must be on or before --date-to.")
 
+        app_settings = AppSettings.load()
+        # A deployment that has never done its initial load uploads everything
+        # outstanding instead of one night's window. That is a superset of the
+        # window, so nothing is skipped by not also running the daily upload.
+        # An explicitly requested range always wins — someone asking for specific
+        # dates means those dates.
+        explicit_range = bool(options['date_from'] or options['date_to'])
+        if options['backfill'] and explicit_range:
+            raise CommandError(
+                '--backfill uploads every pending appointment and ignores the '
+                'date range. Pass one or the other, not both.'
+            )
+        is_backfill = options['backfill'] or (
+            not explicit_range and not app_settings.initial_backfill_done
+        )
+        if is_backfill and not options['backfill']:
+            self.stdout.write(self.style.WARNING(
+                'No initial upload has been recorded for this deployment; '
+                'uploading all pending appointments instead of the nightly window.'
+            ))
+
         if options['facility']:
             try:
                 facility = Facility.objects.get(pk=options['facility'])
@@ -99,10 +127,10 @@ class Command(BaseCommand):
                 raise CommandError('Facility {} does not exist.'.format(options['facility']))
             return services.create_run(
                 date_from, date_to, triggered_by='cron',
-                mode='multi', facilities=[facility],
+                mode='multi', facilities=[facility], is_backfill=is_backfill,
             )
 
-        if AppSettings.load().multi_facility_enabled:
+        if app_settings.multi_facility_enabled:
             if not Facility.objects.filter(is_active=True).exists():
                 raise CommandError(
                     'Multi-facility mode is enabled but no active facilities are '
@@ -110,10 +138,12 @@ class Command(BaseCommand):
                 )
             return services.create_run(
                 date_from, date_to, triggered_by='cron', mode='multi',
+                is_backfill=is_backfill,
             )
 
         return services.create_run(
             date_from, date_to, triggered_by='cron', mode='single',
+            is_backfill=is_backfill,
         )
 
     def _report(self, run):

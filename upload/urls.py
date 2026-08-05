@@ -6,6 +6,7 @@ app_name = 'upload'
 
 urlpatterns = [
     path('', views.upload_view, name='upload'),
+    path('backfill/', views.backfill_upload, name='backfill_upload'),
     path('runs/<int:run_id>/progress/', views.run_progress, name='run_progress'),
 
     path('multi-facilities/', views.multi_facilities, name='multi_facilities'),

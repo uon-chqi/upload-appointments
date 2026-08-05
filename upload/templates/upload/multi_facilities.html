@@ -44,6 +44,7 @@
                     <th>User</th>
                     <th>MFL</th>
                     <th>Last Test</th>
+                    <th>Initial Load</th>
                     <th>Active</th>
                     <th></th>
                 </tr>
@@ -70,6 +71,13 @@
                             <span class="muted">{{ facility.last_tested_at|date:"M j, H:i" }}</span>
                         {% else %}
                             <span class="badge badge-muted">Never</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if facility.initial_backfill_at %}
+                            <span class="muted">{{ facility.initial_backfill_at|date:"M j, H:i" }}</span>
+                        {% else %}
+                            <span class="badge badge-pending">Pending</span>
                         {% endif %}
                     </td>
                     <td>
@@ -179,6 +187,42 @@
 {# -------------------------------- Upload data -------------------------------- #}
 <div class="tab-panel" id="panel-upload">
     <div class="card">
+        <div class="card-header">
+            <h2>Initial Upload</h2>
+            {% if settings_obj.initial_backfill_done %}
+                <span class="badge badge-success">Done</span>
+            {% else %}
+                <span class="badge badge-pending">Not yet run</span>
+            {% endif %}
+        </div>
+        {% if settings_obj.initial_backfill_done %}
+            <p style="color:#666; font-size:14px;">
+                All pending appointments were uploaded on
+                <strong>{{ settings_obj.initial_backfill_at|date:"Y-m-d H:i" }}</strong>.
+                Nightly runs now upload only what was booked that day.
+                {% if backfill_pending_count %}
+                    <br><span class="badge badge-partial">{{ backfill_pending_count }} facility(ies) missed it</span>
+                    — retry them from the failed run below, or run it again for everyone.
+                {% endif %}
+            </p>
+        {% else %}
+            <p style="color:#666; font-size:14px;">
+                This deployment has not yet uploaded its existing pending appointments.
+                The next nightly cron job will do it automatically; use the button to
+                do it now instead. Every pending appointment is sent, whenever it was
+                booked — this takes considerably longer than a nightly run.
+            </p>
+        {% endif %}
+        <form method="post" action="{% url 'upload:backfill_upload' %}" id="backfill-form">
+            {% csrf_token %}
+            <button type="submit" class="btn {% if settings_obj.initial_backfill_done %}btn-secondary{% else %}btn-primary{% endif %}"
+                    id="backfill-btn">
+                {% if settings_obj.initial_backfill_done %}Run it again{% else %}Upload all pending now{% endif %}
+            </button>
+        </form>
+    </div>
+
+    <div class="card">
         <h2 style="margin-top:0">Manual Upload — All Facilities</h2>
         <p style="margin-bottom:16px; color:#666; font-size:14px;">
             Uploads every active facility for the selected date range.
@@ -237,7 +281,13 @@
                 {% for run in runs %}
                 <tr>
                     <td><button type="button" class="expand-btn" data-run="{{ run.pk }}">&#9656;</button></td>
-                    <td>{{ run.date_from }} — {{ run.date_to }}</td>
+                    <td>
+                        {% if run.is_backfill %}
+                            <span class="badge badge-cron">All pending</span>
+                        {% else %}
+                            {{ run.date_from }} — {{ run.date_to }}
+                        {% endif %}
+                    </td>
                     <td>
                         <span class="badge {% if run.triggered_by == 'cron' %}badge-cron{% else %}badge-manual{% endif %}">
                             {{ run.get_triggered_by_display }}
@@ -423,40 +473,63 @@
         detailToggle.textContent = open ? 'Show per-facility detail' : 'Hide per-facility detail';
     });
 
-    uploadForm.addEventListener('submit', function(e) {
-        e.preventDefault();
-        uploadBtn.disabled = true;
-        uploadBtn.textContent = 'Uploading...';
-        container.style.display = 'block';
-        rollUp.style.display = 'flex';
-        detailToggle.style.display = 'inline-block';
-        bar.style.width = '0%';
-        bar.textContent = '0%';
-        bar.style.background = '#3498db';
-        status.textContent = 'Starting upload...';
-        status.className = 'progress-status';
+    // Both the dated upload and the initial backfill drive the same progress
+    // panel; only the button that started the run gets re-enabled at the end.
+    let activeBtn = uploadBtn;
+    let activeLabel = uploadBtn.textContent;
 
-        fetch(uploadForm.action, {
-            method: 'POST',
-            body: new FormData(uploadForm),
-            headers: {'X-Requested-With': 'XMLHttpRequest'},
-        })
-        .then(function(resp) { return resp.json().then(function(d) { return {ok: resp.ok, data: d}; }); })
-        .then(function(result) {
-            if (!result.ok) {
-                finish(result.data.error || 'Could not start upload.', 'status-failed');
-                return;
-            }
-            poll(result.data.run_id);
-        })
-        .catch(function(err) { finish('Error starting upload: ' + err, 'status-failed'); });
-    });
+    function submitUpload(form, btn, confirmMessage) {
+        return function(e) {
+            e.preventDefault();
+            if (confirmMessage && !confirm(confirmMessage)) { return; }
+            activeBtn = btn;
+            activeLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Uploading...';
+            container.style.display = 'block';
+            rollUp.style.display = 'flex';
+            detailToggle.style.display = 'inline-block';
+            bar.style.width = '0%';
+            bar.textContent = '0%';
+            bar.style.background = '#3498db';
+            status.textContent = 'Starting upload...';
+            status.className = 'progress-status';
+            container.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+
+            fetch(form.action, {
+                method: 'POST',
+                body: new FormData(form),
+                headers: {'X-Requested-With': 'XMLHttpRequest'},
+            })
+            .then(function(resp) { return resp.json().then(function(d) { return {ok: resp.ok, data: d}; }); })
+            .then(function(result) {
+                if (!result.ok) {
+                    finish(result.data.error || 'Could not start upload.', 'status-failed');
+                    return;
+                }
+                poll(result.data.run_id);
+            })
+            .catch(function(err) { finish('Error starting upload: ' + err, 'status-failed'); });
+        };
+    }
+
+    uploadForm.addEventListener('submit', submitUpload(uploadForm, uploadBtn));
+
+    const backfillForm = document.getElementById('backfill-form');
+    const backfillBtn = document.getElementById('backfill-btn');
+    if (backfillForm) {
+        backfillForm.addEventListener('submit', submitUpload(
+            backfillForm, backfillBtn,
+            'Upload every pending appointment for all active facilities? ' +
+            'This can take considerably longer than a nightly run.'
+        ));
+    }
 
     function finish(message, cls) {
         status.textContent = message;
         status.className = 'progress-status ' + (cls || '');
-        uploadBtn.disabled = false;
-        uploadBtn.textContent = 'Upload All Facilities';
+        activeBtn.disabled = false;
+        activeBtn.textContent = activeLabel;
     }
 
     function poll(runId) {

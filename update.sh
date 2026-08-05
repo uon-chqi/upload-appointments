@@ -55,6 +55,40 @@ fi
 
 log "Updated $BEFORE -> $AFTER. Applying changes..."
 
+# From here the tree is already on the new revision, so a failure part-way
+# through would leave the code ahead of the database. That matters because cron
+# runs the upload straight after this script (joined with ';', so a failed
+# update does not skip the night's upload): new code against an old schema dies
+# on the first query. Worse, the next run would see BEFORE == AFTER and exit
+# early without ever retrying the migration, so the instance would stay broken
+# until someone logged in.
+#
+# So on any failure, put the working tree back. The database is deliberately
+# left alone: migrations are additive, and the older code ignores columns it
+# does not know about, whereas trying to unapply them is neither reliable nor
+# reversible.
+rollback() {
+    local failed_line="$1"
+    log "ERROR: update failed at line $failed_line."
+    if ! git reset --hard "$BEFORE"; then
+        log "ERROR: rollback failed too. Instance left on $AFTER — fix it by hand."
+        exit 1
+    fi
+
+    # pip may already have upgraded packages for the newer revision, so put the
+    # venv back to what this one expects before restarting into it.
+    if ! "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" -q; then
+        log "WARNING: could not reinstall dependencies for $BEFORE."
+    fi
+    chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
+    chmod 666 "$APP_DIR"/db.sqlite3* 2>/dev/null || true
+    systemctl restart "$SERVICE_NAME" || log "WARNING: service restart failed."
+
+    log "Rolled back to $BEFORE. The update will be retried on the next run."
+    exit 1
+}
+trap 'rollback $LINENO' ERR
+
 # Dependencies may have changed.
 "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" -q
 
@@ -74,5 +108,8 @@ chmod 666 "$APP_DIR"/db.sqlite3* 2>/dev/null || true
 # upload_appointments cron command is a fresh process and picks it up on its
 # own, but the web UI needs the restart.)
 systemctl restart "$SERVICE_NAME"
+
+# Past the point where rolling back would help: the new revision is live.
+trap - ERR
 
 log "Update complete; service restarted on revision $AFTER."

@@ -18,6 +18,21 @@ class AppSettings(models.Model):
         help_text='When enabled, the cron job uploads every active facility '
                   'instead of the environment-configured one.',
     )
+
+    # A fresh install has no history upstream, so the first run uploads every
+    # pending appointment rather than one night's window. Recorded here so it
+    # happens exactly once: whichever comes first, the operator pressing the
+    # button or the next cron firing, and never again afterwards.
+    initial_backfill_done = models.BooleanField(
+        default=False,
+        help_text='Whether the one-off upload of all pending appointments has run.',
+    )
+    initial_backfill_at = models.DateTimeField(null=True, blank=True)
+    initial_backfill_run = models.ForeignKey(
+        'UploadRun', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+',
+    )
+
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -66,6 +81,10 @@ class Facility(models.Model):
     mfl_facility_name = models.CharField(max_length=200, blank=True, default='')
 
     is_active = models.BooleanField(default=True)
+    # When this facility's pending appointments were last fully loaded. Per
+    # facility as well as deployment-wide, because a backfill across a hundred
+    # containers will normally leave a few behind for the operator to retry.
+    initial_backfill_at = models.DateTimeField(null=True, blank=True)
     last_tested_at = models.DateTimeField(null=True, blank=True)
     last_test_ok = models.BooleanField(null=True, blank=True)
     last_test_message = models.TextField(blank=True, default='')
@@ -126,6 +145,10 @@ class UploadRun(models.Model):
 
     date_from = models.DateField()
     date_to = models.DateField()
+    # A backfill ignores date_from/date_to and uploads every pending appointment.
+    # The dates are still stored — they record the day it ran — but the UI shows
+    # "all pending" for these, since a range would be a lie.
+    is_backfill = models.BooleanField(default=False)
     mode = models.CharField(max_length=10, choices=MODE_CHOICES, default='single')
     triggered_by = models.CharField(max_length=10, choices=TRIGGER_CHOICES)
     triggered_by_user = models.ForeignKey(
@@ -154,13 +177,17 @@ class UploadRun(models.Model):
         ordering = ['-created_at']
 
     def __str__(self):
-        return '{} to {} — {} ({})'.format(
-            self.date_from, self.date_to, self.status, self.mode,
-        )
+        return '{} — {} ({})'.format(self.period_label, self.status, self.mode)
 
     @property
     def is_active(self):
         return self.status in self.ACTIVE_STATUSES
+
+    @property
+    def period_label(self):
+        if self.is_backfill:
+            return 'All pending appointments'
+        return '{} to {}'.format(self.date_from, self.date_to)
 
 
 class UploadLog(models.Model):

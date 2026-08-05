@@ -36,7 +36,11 @@ READ_TIMEOUT = 900
 # The `%%` in the LIKE patterns are literal percent signs: this string goes
 # through MySQLdb's parameter interpolation, which treats a single `%` as a
 # placeholder marker.
-APPOINTMENT_QUERY = """
+#
+# _APPOINTMENT_QUERY_BODY stops just short of the date predicate so the two
+# variants below can share it — concatenated rather than formatted, because
+# str.format would choke the moment someone adds a brace to the SQL.
+_APPOINTMENT_QUERY_BODY = """
 with pending_appointments as (select x.patient_id, x.start_date_time, x.status, y.name as appointment_type, x.date_appointment_scheduled
 from patient_appointment x
 inner join appointment_service y on x.appointment_service_id = y.appointment_service_id
@@ -151,8 +155,18 @@ from pending_appointments a
 inner join person b on a.patient_id = b.person_id
 left join person_address d on a.patient_id = d.person_id
 ) data where data.consented='Yes'
-and data.date_appointment_scheduled between %s and %s
 """
+
+# The nightly run: appointments booked within the given window.
+APPOINTMENT_QUERY = (
+    _APPOINTMENT_QUERY_BODY + "and data.date_appointment_scheduled between %s and %s\n"
+)
+
+# The one-off initial load: every pending appointment the facility has, however
+# long ago it was booked. `pending_appointments` still bounds this to
+# non-cancelled appointments in the future, so it is "everything outstanding",
+# not "everything ever".
+APPOINTMENT_BACKFILL_QUERY = _APPOINTMENT_QUERY_BODY
 
 # A KenyaEMR container carries the whole national facility list in `location`
 # (~13,700 rows), so the container's own identity has to come from the
@@ -264,19 +278,27 @@ def _safe_float(value, default=0.0):
         return default
 
 
-def fetch_appointments(conn, date_from, date_to):
-    """Query one facility's OpenMRS database for appointments in a date range.
+def fetch_appointments(conn, date_from=None, date_to=None):
+    """Query one facility's OpenMRS database for pending appointments.
 
     The range is matched against `date_appointment_scheduled` — when the
     appointment was booked — so a nightly run picks up whatever was booked in the
     window, whenever the appointment itself falls.
+
+    Passing no dates runs the backfill variant: every pending appointment,
+    whenever it was booked. That is what a freshly installed deployment needs
+    once, before the nightly windows start making sense.
     """
+    backfill = date_from is None and date_to is None
     cursor = conn.cursor()
     try:
-        cursor.execute(APPOINTMENT_QUERY, [
-            date_from.strftime('%Y-%m-%d'),
-            date_to.strftime('%Y-%m-%d'),
-        ])
+        if backfill:
+            cursor.execute(APPOINTMENT_BACKFILL_QUERY)
+        else:
+            cursor.execute(APPOINTMENT_QUERY, [
+                date_from.strftime('%Y-%m-%d'),
+                date_to.strftime('%Y-%m-%d'),
+            ])
         columns = [col[0] for col in cursor.description]
         rows = cursor.fetchall()
     finally:
