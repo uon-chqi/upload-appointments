@@ -24,8 +24,32 @@ READ_TIMEOUT = 900
 # FacilityConfig.database) supplies the schema. The query used to mix
 # `openmrs.encounter` with a bare `global_property`, which already assumed the
 # default schema was `openmrs` — now that assumption is explicit and per-facility.
+#
+# The unit of work is an *appointment*, not a visit: `pending_appointments` takes
+# every future, non-cancelled appointment, and the date range filters on
+# `date_appointment_scheduled` (when the appointment was booked), not on when the
+# patient last showed up. A patient with two future appointments therefore yields
+# two rows. Facility identity comes from the `facility` CTE
+# (kenyaemr.defaultLocation), the same expression PROBE_DEFAULT_LOCATION_QUERY
+# uses, rather than from whatever location the visit happened to carry.
+#
+# The `%%` in the LIKE patterns are literal percent signs: this string goes
+# through MySQLdb's parameter interpolation, which treats a single `%` as a
+# placeholder marker.
 APPOINTMENT_QUERY = """
-with vls as(SELECT distinct
+with pending_appointments as (select x.patient_id, x.start_date_time, x.status, y.name as appointment_type, x.date_appointment_scheduled
+from patient_appointment x
+inner join appointment_service y on x.appointment_service_id = y.appointment_service_id
+where x.status != 'Cancelled' and x.voided=0 and x.start_date_time > now()),
+facility as (SELECT l.name AS facility_name,
+       (SELECT x.value_reference FROM location_attribute x
+         WHERE x.location_id = l.location_id LIMIT 1) AS facility_mfl
+FROM location l
+WHERE l.location_id = (
+    SELECT property_value FROM global_property
+    WHERE property = 'kenyaemr.defaultLocation' AND property_value <> '' LIMIT 1
+)),
+vls as (SELECT distinct
     e.patient_id,
     CASE
         WHEN cn2.name = 'NOT DETECTED' THEN '0.00'
@@ -74,104 +98,60 @@ LEFT JOIN concept_name cn1
     AND cn1.locale = 'en'
     AND cn1.concept_name_type = 'FULLY_SPECIFIED'
 WHERE e.voided = 0 AND cn1.name LIKE '%%cd4%%')
-select max(a.patient_id) as patient_id
-, max(a.visit_date) as visit_date
-, max(appointment_date) as appointment_date
-, max(patient_name) as patient_name
-, max(a.gender) as gender
-, max(a.dob) as dob
-, max(a.age) as age
-, max(a.ccc_number) as ccc_number
-, max(a.phone_number) as phone_number
-, coalesce(max(a.risk_score), max(a.risk_classification)) as risk_classification_value
-, coalesce(max(a.risk_description), (case when max(a.risk_classification) is null then 'Unknown Risk'
-	when max(a.risk_classification) = 0 then 'Unknown Risk'
-	when max(a.risk_classification) <= (select property_value from global_property where property='kenyaemrml.iit.lowRiskThreshold' limit 1) then 'Low Risk'
-	when max(a.risk_classification) <= (select property_value from global_property where property='kenyaemrml.iit.mediumRiskThreshold' limit 1) then 'Medium Risk'
-	when max(a.risk_classification) <= (select property_value from global_property where property='kenyaemrml.iit.highRiskThreshold' limit 1) then 'High Risk'
-	else 'Unknown Risk'
-	end)) as risk_classification
-, coalesce(max(a.risk_date), max(a.risk_classification_date)) as risk_classification_date
-, max(a.risk_factors) as risk_factors
+select * from
+(
+select distinct a.patient_id
+, (select date_started from visit x where x.patient_id = a.patient_id order by date_started desc limit 1) as visit_date
+, a.date_appointment_scheduled
+, a.start_date_time as appointment_date
+, a.status as appointment_status
+, a.appointment_type
+, (select concat(x.given_name, ' ', ifnull(x.middle_name, '') , ' ', x.family_name)
+    from person_name x where x.person_id =a.patient_id limit 1) as patient_name
+, b.gender
+, b.birthdate as dob
+, round(TIMESTAMPDIFF(month, b.birthdate, now())/12.0, 0) as age
+, (select x.identifier from patient_identifier x inner join patient_identifier_type y on x.identifier_type=y.patient_identifier_type_id
+and y.name ='Unique Patient Number' where x.patient_id = a.patient_id limit 1) as ccc_number
+, (select x.value from person_attribute x inner join person_attribute_type y on x.person_attribute_type_id =y.person_attribute_type_id
+and y.name='Telephone contact' where x.person_id = a.patient_id limit 1) as phone_number
+, d.county_district as county
+, d.state_province as sub_county
+, d.address4 as ward
+, d.city_village
+, d.address2 as landmark
+, d.address5
+, d.address6
+, (select y.name from obs x inner join concept_name y on x.value_coded=y.concept_id where x.concept_id =1054 and y.locale ='en' and x.person_id=a.patient_id limit 1) as marital_status
+, null as case_manager_assigned
+, (select x.facility_mfl from facility x limit 1) as facility_mfl
+, (select x.facility_name from facility x limit 1) as facility_name
+, (select case when x.value_coded=1065 then 'Yes' else 'No' end as response from obs x where x.concept_id=166607 and x.person_id=a.patient_id order by obs_datetime desc limit 1) as consented
+, (SELECT GROUP_CONCAT(y.name SEPARATOR ', ') FROM patient_program x INNER JOIN program y ON x.program_id = y.program_id and x.patient_id=a.patient_id WHERE x.date_completed IS NULL) AS program
+, (select risk_score from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_classification_value
+, (select description from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_classification
+, (select risk_factors from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_factors
+, (select evaluation_date from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_classification_date
 , (select TestResults from vls x where x.patient_id=a.patient_id order by VLDate desc limit 1) as last_viral_load
 , (select VLDate from vls x where x.patient_id=a.patient_id order by VLDate desc limit 1) as last_viral_load_date
 , (select TestResults from cd4 x where x.patient_id=a.patient_id order by TestDate desc limit 1) as last_cd4
 , (select TestDate from cd4 x where x.patient_id=a.patient_id order by TestDate desc limit 1) as last_cd4_date
-, max(a.appointment_status) as appointment_status
-, max(a.county) as county
-, max(a.sub_county) as sub_county
-, max(a.ward) as ward
-, max(a.city_village) as city_village
-, max(a.landmark) as landmark
-, max(a.address5) as address5
-, max(a.address6) as address6
-, max(a.marital_status) as marital_status
-, max(a.case_manager_assigned) as case_manager_assigned
-, max(a.facility_mfl) as facility_mfl
-, max(a.facility_name) as facility_name
-, max(a.consented) as consented
-, max(a.program) as program
-, max(a.lmp) as lmp
-, max(a.edd) as edd
-, max(a.delivery_date) as delivery_date
-, max(a.intervention_list) as intervention_list
-, max(a.cormobidities) as cormobidities
-, max(a.enrollment_date) as enrollment_date
-, max(a.start_ART_date) as start_ART_date
-, case when max(a.restart_ART_date) > max(a.start_ART_date) then max(a.restart_ART_date) else null end as restart_ART_date
-from
-(
-    select distinct a.patient_id
-    , date(a.date_started) as visit_date
-    , (select x.start_date_time from patient_appointment x where x.patient_id = a.patient_id and x.status != 'Cancelled' and x.voided=0
-    order by x.start_date_time desc limit 1) as appointment_date
-    , (select concat(x.given_name, ' ', ifnull(x.middle_name, '') , ' ', x.family_name)
-        from person_name x where x.person_id =a.patient_id limit 1) as patient_name
-    , b.gender
-    , b.birthdate as dob
-    , round(TIMESTAMPDIFF(month, b.birthdate, now())/12.0, 0) as age
-    , (select x.identifier from patient_identifier x inner join patient_identifier_type y on x.identifier_type=y.patient_identifier_type_id
-    and y.name ='Unique Patient Number' where x.patient_id = a.patient_id limit 1) as ccc_number
-    , (select x.value from person_attribute x inner join person_attribute_type y on x.person_attribute_type_id =y.person_attribute_type_id
-    and y.name='Telephone contact' where x.person_id = a.patient_id limit 1) as phone_number
-    , (select x.value_numeric from obs x where x.concept_id=167162 and x.person_id=a.patient_id and x.value_numeric>0 order by x.obs_datetime desc limit 1) as risk_classification
-    , (select x.obs_datetime from obs x where x.concept_id=167162 and x.person_id=a.patient_id and x.value_numeric>0 order by x.obs_datetime desc limit 1) as risk_classification_date
-    , 'Pending' as appointment_status
-    , c.name
-    , d.county_district as county
-    , d.state_province as sub_county
-    , d.address4 as ward
-    , d.city_village
-    , d.address2 as landmark
-    , d.address5
-    , d.address6
-    , (select y.name from obs x inner join concept_name y on x.value_coded=y.concept_id where x.concept_id =1054 and y.locale ='en' and x.person_id=a.patient_id limit 1) as marital_status
-    , null as case_manager_assigned
-    , (select x.value_reference from location_attribute x where x.location_id = a.location_id limit 1) as facility_mfl
-    , (select x.name from location x where x.location_id = a.location_id) as facility_name
-    , (select case when x.value_coded=1065 then 'Yes' else 'No' end as response from obs x where x.concept_id=166607 and x.person_id=a.patient_id order by obs_datetime desc limit 1) as consented
-    , (SELECT GROUP_CONCAT(y.name SEPARATOR ', ') FROM patient_program x INNER JOIN program y ON x.program_id = y.program_id and x.patient_id=a.patient_id WHERE x.date_completed IS NULL) AS program
-    , (select risk_score from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_score
-    , (select description from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_description
-    , (select risk_factors from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_factors
-    , (select evaluation_date from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_date
-	, null as lmp
-	, null as edd
-	, null as delivery_date
-	, null as intervention_list
-	, null as cormobidities
-	, (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id limit 1) as enrollment_date
-	, (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id limit 1) as start_ART_date
-	, (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id order by x.date_enrolled desc limit 1) as restart_ART_date
-    from visit a
-    inner join person b on a.patient_id = b.person_id
-    left join visit_type c on a.visit_type_id = c.visit_type_id
-    left join person_address d on a.patient_id = d.person_id
-    where a.date_started >= %s and a.date_started <= %s
-    and a.patient_id in (select x.patient_id from patient_program x
-						inner join program y on x.program_id =y.program_id
-						where y.name ='HIV')
-) a where a.consented='Yes' group by a.patient_id, a.appointment_date
+, null as lmp
+, null as edd
+, null as delivery_date
+, null as intervention_list
+, null as cormobidities
+, (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id limit 1) as enrollment_date
+, (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id limit 1) as start_ART_date
+, case when (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id limit 1) <
+     (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id order by x.date_enrolled desc limit 1)
+    then (select x.date_enrolled from patient_program x inner join program y on x.program_id =y.program_id where y.name ='HIV' and x.patient_id =a.patient_id order by x.date_enrolled desc limit 1)
+    else null end as restart_ART_date
+from pending_appointments a
+inner join person b on a.patient_id = b.person_id
+left join person_address d on a.patient_id = d.person_id
+) data where data.consented='Yes'
+and data.date_appointment_scheduled between %s and %s
 """
 
 # A KenyaEMR container carries the whole national facility list in `location`
@@ -285,7 +265,12 @@ def _safe_float(value, default=0.0):
 
 
 def fetch_appointments(conn, date_from, date_to):
-    """Query one facility's OpenMRS database for appointments in a date range."""
+    """Query one facility's OpenMRS database for appointments in a date range.
+
+    The range is matched against `date_appointment_scheduled` — when the
+    appointment was booked — so a nightly run picks up whatever was booked in the
+    window, whenever the appointment itself falls.
+    """
     cursor = conn.cursor()
     try:
         cursor.execute(APPOINTMENT_QUERY, [
@@ -331,6 +316,8 @@ def fetch_appointments(conn, date_from, date_to):
             'last_cd4_date': _safe_str(record.get('last_cd4_date')),
             'appointment_status': _safe_str(record.get('appointment_status'), 'Pending'),
             'appointment_date': _safe_str(record.get('appointment_date')),
+            'appointment_type': _safe_str(record.get('appointment_type')),
+            'date_appointment_scheduled': _safe_str(record.get('date_appointment_scheduled')),
             'visit_date': _safe_str(record.get('visit_date')),
             'case_manager_assigned': _safe_str(record.get('case_manager_assigned')),
             'program': _safe_str(record.get('program')),
