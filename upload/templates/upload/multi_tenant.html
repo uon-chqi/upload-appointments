@@ -1,0 +1,439 @@
+{% extends "upload/base.html" %}
+
+{% block title %}Multi-Tenant Upload{% endblock %}
+{% block heading %}Multi-Tenant Upload{% endblock %}
+
+{% block nav_links %}
+<a href="{% url 'upload:multi_facilities' %}">Multi-facility</a>
+&nbsp;·&nbsp;
+<a href="{% url 'upload:upload' %}">&larr; Single facility</a>
+{% endblock %}
+
+{% block content %}
+<div class="tabs">
+    <button class="tab active" data-panel="setup">Server Setup</button>
+    <button class="tab" data-panel="upload">Upload Data</button>
+</div>
+
+{# -------------------------------- Server setup ------------------------------- #}
+<div class="tab-panel active" id="panel-setup">
+    <div class="card">
+        <form method="post" action="{% url 'upload:tenant_settings' %}">
+            {% csrf_token %}
+            <label style="display:flex; align-items:center; gap:10px; font-weight:600;">
+                <input type="checkbox" name="multi_tenant_enabled"
+                       {% if settings_obj.multi_tenant_enabled %}checked{% endif %}
+                       onchange="this.form.submit()">
+                Enable multi-tenant mode
+            </label>
+            <div class="help">
+                Controls the nightly cron job only. When enabled it re-reads each server's
+                database list and uploads every active database below. Turning this on turns
+                multi-facility mode off — the two describe different deployments. Manual
+                uploads on this page work either way.
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>Tenant Servers ({{ servers|length }})</h2>
+            <button type="button" class="btn btn-primary" id="add-server-btn">Add Server</button>
+        </div>
+        <p style="color:#666; font-size:14px; margin-bottom:16px;">
+            One MySQL instance holding an OpenMRS database per facility. Enter the connection
+            once; every database whose name starts with the prefix is picked up automatically,
+            and each one is asked for its own facility name and MFL code.
+        </p>
+        {% if servers %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Connection</th>
+                    <th>User</th>
+                    <th>Prefix</th>
+                    <th>Databases</th>
+                    <th>Last Sync</th>
+                    <th>Active</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for server in servers %}
+                <tr>
+                    <td><strong>{{ server.name }}</strong></td>
+                    <td class="mono">{{ server.host }}:{{ server.port }}</td>
+                    <td class="mono">{{ server.username }}</td>
+                    <td class="mono">{{ server.database_prefix|default:"(all)" }}</td>
+                    <td>{{ server.facilities.count }}</td>
+                    <td>
+                        {% if server.last_synced_at %}
+                            <span class="badge {% if server.last_sync_ok %}badge-success{% else %}badge-failed{% endif %}"
+                                  title="{{ server.last_sync_message }}">
+                                {% if server.last_sync_ok %}OK{% else %}Issues{% endif %}
+                            </span>
+                            <span class="muted">{{ server.last_synced_at|date:"M j, H:i" }}</span>
+                        {% else %}
+                            <span class="badge badge-muted">Never</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if server.is_active %}
+                            <span class="badge badge-success">Yes</span>
+                        {% else %}
+                            <span class="badge badge-muted">No</span>
+                        {% endif %}
+                    </td>
+                    <td style="white-space:nowrap">
+                        <button type="button" class="btn btn-secondary btn-sm sync-btn"
+                                data-pk="{{ server.pk }}">Sync</button>
+                        <button type="button" class="btn btn-secondary btn-sm edit-server-btn"
+                                data-pk="{{ server.pk }}"
+                                data-name="{{ server.name }}"
+                                data-host="{{ server.host }}"
+                                data-port="{{ server.port }}"
+                                data-username="{{ server.username }}"
+                                data-prefix="{{ server.database_prefix }}"
+                                data-active="{{ server.is_active|yesno:'1,0' }}">Edit</button>
+                        <form method="post" action="{% url 'upload:tenant_server_delete' pk=server.pk %}"
+                              style="display:inline"
+                              onsubmit="return confirm('Delete {{ server.name|escapejs }} and the {{ server.facilities.count }} database(s) discovered on it? Upload history is kept.');">
+                            {% csrf_token %}
+                            <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+            <div class="empty">No tenant servers added yet.</div>
+        {% endif %}
+        <div id="sync-result" style="margin-top:16px"></div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>Discovered Databases ({{ active_count }} active of {{ facilities|length }})</h2>
+        </div>
+        {% if facilities %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Facility</th>
+                    <th>Server</th>
+                    <th>Database</th>
+                    <th>MFL</th>
+                    <th>Last Seen</th>
+                    <th>Initial Load</th>
+                    <th>Active</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for facility in facilities %}
+                <tr>
+                    <td><strong>{{ facility.name }}</strong></td>
+                    <td>{{ facility.server.name }}</td>
+                    <td class="mono">{{ facility.database_name }}</td>
+                    <td>
+                        {% if facility.mfl_code %}
+                            <span class="mono">{{ facility.mfl_code }}</span>
+                        {% else %}
+                            <span class="badge badge-failed"
+                                  title="{{ facility.last_test_message }}">Not identified</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if facility.last_seen_at %}
+                            <span class="muted">{{ facility.last_seen_at|date:"M j, H:i" }}</span>
+                        {% else %}
+                            <span class="muted">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if facility.initial_backfill_at %}
+                            <span class="muted">{{ facility.initial_backfill_at|date:"M j, H:i" }}</span>
+                        {% else %}
+                            <span class="badge badge-pending">Pending</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if facility.is_active %}
+                            <span class="badge badge-success">Yes</span>
+                        {% elif facility.disabled_by_sync %}
+                            <span class="badge badge-failed"
+                                  title="{{ facility.last_test_message }}">Auto-disabled</span>
+                        {% else %}
+                            <span class="badge badge-muted">No</span>
+                        {% endif %}
+                    </td>
+                    <td style="white-space:nowrap">
+                        <form method="post" action="{% url 'upload:tenant_toggle' pk=facility.pk %}"
+                              style="display:inline">
+                            {% csrf_token %}
+                            <button type="submit" class="btn btn-secondary btn-sm">
+                                {% if facility.is_active %}Disable{% else %}Enable{% endif %}
+                            </button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <div class="help" style="margin-top:12px">
+            Databases are added and removed by syncing, not by hand. One that cannot be
+            identified — no MFL code, or an MFL another facility already claims — is disabled
+            automatically, because the DIFF platform files records by MFL alone. Enabling or
+            disabling one yourself sticks: later syncs leave your choice alone.
+        </div>
+        {% else %}
+            <div class="empty">
+                No databases discovered yet. Add a server above — saving it runs the first sync.
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="modal-backdrop {% if server_form.errors %}open{% endif %}" id="server-modal">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="server-form-title">
+            <div class="modal-header">
+                <h2 id="server-form-title">
+                    {% if editing_pk %}Edit Server{% else %}Add Server{% endif %}
+                </h2>
+                <button type="button" class="modal-close" id="modal-close" aria-label="Close">&times;</button>
+            </div>
+
+            <form method="post" id="server-form"
+                  data-editing-pk="{{ editing_pk|default_if_none:'' }}"
+                  action="{% if editing_pk %}{% url 'upload:tenant_server_edit' pk=editing_pk %}{% else %}{% url 'upload:tenant_server_add' %}{% endif %}">
+                {% csrf_token %}
+                {% if server_form.non_field_errors %}
+                    <div class="errors">{{ server_form.non_field_errors }}</div>
+                {% endif %}
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="{{ server_form.name.id_for_label }}">Server Name</label>
+                        {{ server_form.name }}
+                        <div class="help">Label for this server in the UI.</div>
+                        {% if server_form.name.errors %}<div class="errors">{{ server_form.name.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group">
+                        <label for="{{ server_form.host.id_for_label }}">MySQL Host</label>
+                        {{ server_form.host }}
+                        <div class="help">Hostname or IP of the cloud MySQL.</div>
+                        {% if server_form.host.errors %}<div class="errors">{{ server_form.host.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group" style="max-width:120px">
+                        <label for="{{ server_form.port.id_for_label }}">Port</label>
+                        {{ server_form.port }}
+                        {% if server_form.port.errors %}<div class="errors">{{ server_form.port.errors.0 }}</div>{% endif %}
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="{{ server_form.username.id_for_label }}">MySQL User</label>
+                        {{ server_form.username }}
+                        <div class="help">A read-only user with access to every tenant database.</div>
+                        {% if server_form.username.errors %}<div class="errors">{{ server_form.username.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group">
+                        <label for="{{ server_form.password.id_for_label }}">MySQL Password</label>
+                        {{ server_form.password }}
+                        <div class="help" id="password-help">Stored encrypted.</div>
+                        {% if server_form.password.errors %}<div class="errors">{{ server_form.password.errors.0 }}</div>{% endif %}
+                    </div>
+                    <div class="form-group">
+                        <label for="{{ server_form.database_prefix.id_for_label }}">Database Prefix</label>
+                        {{ server_form.database_prefix }}
+                        <div class="help">Databases starting with this are treated as facilities.
+                            Leave blank for every database this account can see.</div>
+                        {% if server_form.database_prefix.errors %}<div class="errors">{{ server_form.database_prefix.errors.0 }}</div>{% endif %}
+                    </div>
+                </div>
+                <label style="display:flex; align-items:center; gap:8px; font-size:14px;">
+                    {{ server_form.is_active }} Active
+                </label>
+
+                <div id="test-result" style="margin-top:16px"></div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="test-btn">Test Connection</button>
+                    <div class="spacer"></div>
+                    <button type="button" class="btn btn-secondary" id="cancel-edit">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="server-submit">
+                        {% if editing_pk %}Save &amp; Sync{% else %}Add &amp; Sync{% endif %}
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+{# -------------------------------- Upload data -------------------------------- #}
+<div class="tab-panel" id="panel-upload">
+    {% include "upload/includes/_run_panel.html" with upload_url='upload:tenant_upload' unit='database' unit_plural='databases' history_empty='No multi-tenant uploads yet.' %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% include "upload/includes/_run_scripts.html" with unit_plural='databases' %}
+<script>
+(function() {
+    const editUrl = '{% url "upload:tenant_server_edit" pk=0 %}';
+    const addUrl = '{% url "upload:tenant_server_add" %}';
+    const testUrl = '{% url "upload:tenant_server_test" %}';
+    const syncUrl = '{% url "upload:tenant_server_sync" pk=0 %}';
+    const csrf = document.querySelector('[name=csrfmiddlewaretoken]').value;
+    const escapeHtml = runPanel.escapeHtml;
+
+    /* ------------------------------- tabs -------------------------------- */
+    const tabs = document.querySelectorAll('.tab');
+    function showPanel(name) {
+        tabs.forEach(function(t) { t.classList.toggle('active', t.dataset.panel === name); });
+        document.querySelectorAll('.tab-panel').forEach(function(p) {
+            p.classList.toggle('active', p.id === 'panel-' + name);
+        });
+    }
+    tabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+            showPanel(tab.dataset.panel);
+            history.replaceState(null, '', '#' + tab.dataset.panel);
+        });
+    });
+    if (location.hash === '#upload') { showPanel('upload'); }
+    // A retry starts from the history table, which lives on the upload tab.
+    runPanel.onRetry = function() { showPanel('upload'); };
+
+    /* ---------------------------- server modal ---------------------------- */
+    const modal = document.getElementById('server-modal');
+    const serverForm = document.getElementById('server-form');
+    const formTitle = document.getElementById('server-form-title');
+    const submitBtn = document.getElementById('server-submit');
+    const cancelBtn = document.getElementById('cancel-edit');
+    const closeBtn = document.getElementById('modal-close');
+    const passwordHelp = document.getElementById('password-help');
+    const testResult = document.getElementById('test-result');
+    // Non-empty when the server re-rendered this form after a failed edit, in
+    // which case the modal is already open and must stay pointed at that row.
+    let editingPk = serverForm.dataset.editingPk || null;
+
+    function field(name) { return serverForm.querySelector('[name="' + name + '"]'); }
+
+    function openModal() {
+        modal.classList.add('open');
+        document.body.style.overflow = 'hidden';
+        field('name').focus();
+    }
+
+    function closeModal() {
+        modal.classList.remove('open');
+        document.body.style.overflow = '';
+    }
+
+    document.getElementById('add-server-btn').addEventListener('click', function() {
+        editingPk = null;
+        serverForm.reset();
+        serverForm.action = addUrl;
+        formTitle.textContent = 'Add Server';
+        submitBtn.textContent = 'Add & Sync';
+        passwordHelp.textContent = 'Stored encrypted.';
+        testResult.innerHTML = '';
+        openModal();
+    });
+
+    document.querySelectorAll('.edit-server-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            editingPk = btn.dataset.pk;
+            field('name').value = btn.dataset.name;
+            field('host').value = btn.dataset.host;
+            field('port').value = btn.dataset.port;
+            field('username').value = btn.dataset.username;
+            field('database_prefix').value = btn.dataset.prefix;
+            field('password').value = '';
+            field('is_active').checked = btn.dataset.active === '1';
+
+            serverForm.action = editUrl.replace('/0/', '/' + editingPk + '/');
+            formTitle.textContent = 'Edit Server';
+            submitBtn.textContent = 'Save & Sync';
+            passwordHelp.textContent = 'Leave blank to keep the existing password.';
+            testResult.innerHTML = '';
+            openModal();
+        });
+    });
+
+    cancelBtn.addEventListener('click', closeModal);
+    closeBtn.addEventListener('click', closeModal);
+
+    modal.addEventListener('click', function(e) {
+        // Backdrop only: a click inside the dialog must not discard the form.
+        if (e.target === modal) { closeModal(); }
+    });
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && modal.classList.contains('open')) { closeModal(); }
+    });
+
+    if (modal.classList.contains('open')) {
+        // Server-rendered validation errors: lock the scroll the same way
+        // openModal() would, without stealing focus from the offending field.
+        document.body.style.overflow = 'hidden';
+    }
+
+    document.getElementById('test-btn').addEventListener('click', function() {
+        const body = new FormData(serverForm);
+        if (editingPk) { body.append('pk', editingPk); }
+        testResult.innerHTML = '<div class="alert alert-info">Testing connection…</div>';
+
+        fetch(testUrl, {method: 'POST', body: body, headers: {'X-CSRFToken': csrf}})
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            const cls = data.ok ? 'alert-success' : 'alert-error';
+            let html = '<div class="alert ' + cls + '">' + escapeHtml(data.message) + '</div>';
+            if (data.sample && data.sample.length) {
+                html += '<div class="help">Matched: ' + data.sample.map(escapeHtml).join(', ');
+                if (data.count > data.sample.length) {
+                    html += ' … and ' + (data.count - data.sample.length) + ' more';
+                }
+                html += '</div>';
+            }
+            testResult.innerHTML = html;
+        })
+        .catch(function(err) {
+            testResult.innerHTML = '<div class="alert alert-error">Test failed: ' + escapeHtml(String(err)) + '</div>';
+        });
+    });
+
+    /* -------------------------------- sync -------------------------------- */
+    const syncResult = document.getElementById('sync-result');
+
+    document.querySelectorAll('.sync-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const label = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Syncing…';
+            syncResult.innerHTML = '<div class="alert alert-info">Reading the database list and identifying each one…</div>';
+
+            fetch(syncUrl.replace('/0/', '/' + btn.dataset.pk + '/'),
+                  {method: 'POST', headers: {'X-CSRFToken': csrf}})
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                const cls = !data.ok ? 'alert-error' : (data.problems.length ? 'alert-info' : 'alert-success');
+                let html = '<div class="alert ' + cls + '">' + escapeHtml(data.message) + '</div>';
+                if (data.problems && data.problems.length) {
+                    html += '<div class="help">' + data.problems.map(escapeHtml).join('<br>') + '</div>';
+                }
+                syncResult.innerHTML = html;
+                // Reload so the tables below show what the sync just changed.
+                setTimeout(function() { location.reload(); }, data.ok ? 1500 : 4000);
+            })
+            .catch(function(err) {
+                btn.disabled = false;
+                btn.textContent = label;
+                syncResult.innerHTML = '<div class="alert alert-error">Sync failed: ' + escapeHtml(String(err)) + '</div>';
+            });
+        });
+    });
+})();
+</script>
+{% endblock %}

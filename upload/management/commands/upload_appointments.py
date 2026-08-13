@@ -3,8 +3,8 @@ from datetime import date, timedelta
 
 from django.core.management.base import BaseCommand, CommandError
 
-from upload import services
-from upload.models import AppSettings, Facility, UploadRun
+from upload import services, tenants
+from upload.models import AppSettings, Facility, TenantServer, UploadRun
 
 
 class Command(BaseCommand):
@@ -44,6 +44,12 @@ class Command(BaseCommand):
             help='Upload every pending appointment, ignoring the date range. '
                  'Runs automatically on the first cron job after install; this '
                  'forces another one.',
+        )
+        parser.add_argument(
+            '--no-sync',
+            action='store_true',
+            help='In multi-tenant mode, upload the schemas already known instead '
+                 'of asking the servers what they hold first.',
         )
 
     def handle(self, *args, **options):
@@ -127,24 +133,56 @@ class Command(BaseCommand):
                 raise CommandError('Facility {} does not exist.'.format(options['facility']))
             return services.create_run(
                 date_from, date_to, triggered_by='cron',
-                mode='multi', facilities=[facility], is_backfill=is_backfill,
+                # A discovered tenant is uploaded as a tenant run, so its history
+                # lands on the page the operator manages it from.
+                mode='tenant' if facility.is_tenant else 'multi',
+                facilities=[facility], is_backfill=is_backfill,
             )
 
-        if app_settings.multi_facility_enabled:
-            if not Facility.objects.filter(is_active=True).exists():
+        mode = app_settings.cron_mode()
+
+        if mode == 'tenant':
+            if not options['no_sync']:
+                self._sync_tenants(options.get('workers'))
+            if not Facility.objects.tenants().filter(is_active=True).exists():
+                raise CommandError(
+                    'Multi-tenant mode is enabled but no active tenant databases '
+                    'have been discovered.'
+                )
+        elif mode == 'multi':
+            if not Facility.objects.standalone().filter(is_active=True).exists():
                 raise CommandError(
                     'Multi-facility mode is enabled but no active facilities are '
                     'configured.'
                 )
-            return services.create_run(
-                date_from, date_to, triggered_by='cron', mode='multi',
-                is_backfill=is_backfill,
-            )
 
         return services.create_run(
-            date_from, date_to, triggered_by='cron', mode='single',
+            date_from, date_to, triggered_by='cron', mode=mode,
             is_backfill=is_backfill,
         )
+
+    def _sync_tenants(self, workers):
+        """Refresh the schema list before uploading it.
+
+        A tenant server gains and loses facilities without anyone touching this
+        deployment, so the nightly run asks rather than assumes. A server that is
+        unreachable is reported and skipped: yesterday's list is a far better
+        basis for tonight's upload than no upload at all.
+        """
+        if not TenantServer.objects.filter(is_active=True).exists():
+            raise CommandError(
+                'Multi-tenant mode is enabled but no active tenant servers are '
+                'configured.'
+            )
+        for server, summary in tenants.sync_all(workers=workers, reprobe=False):
+            if summary['ok']:
+                self.stdout.write('{}: {}'.format(server.name, summary['message']))
+            else:
+                self.stderr.write(self.style.WARNING(
+                    '{}: {} Uploading the databases already known.'.format(
+                        server.name, summary['message'],
+                    )
+                ))
 
     def _report(self, run):
         run.refresh_from_db()

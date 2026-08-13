@@ -1,0 +1,152 @@
+{% comment %}
+The upload half of a multi-target page: initial backfill, dated manual upload
+with live progress, and run history with per-target detail and retry.
+
+Identical for the multi-facility and multi-tenant setups, because a run is a run
+whichever way its targets were configured — only the noun changes. Include with:
+
+    {% include "upload/includes/_run_panel.html" with upload_url='upload:tenant_upload' unit='database' unit_plural='databases' %}
+
+Requires from the view context: form, settings_obj, runs, backfill_pending_count.
+Pair with _run_scripts.html, which drives everything here.
+{% endcomment %}
+<div class="card">
+    <div class="card-header">
+        <h2>Initial Upload</h2>
+        {% if settings_obj.initial_backfill_done %}
+            <span class="badge badge-success">Done</span>
+        {% else %}
+            <span class="badge badge-pending">Not yet run</span>
+        {% endif %}
+    </div>
+    {% if settings_obj.initial_backfill_done %}
+        <p style="color:#666; font-size:14px;">
+            All pending appointments were uploaded on
+            <strong>{{ settings_obj.initial_backfill_at|date:"Y-m-d H:i" }}</strong>.
+            Nightly runs now upload only what was booked that day.
+            {% if backfill_pending_count %}
+                <br><span class="badge badge-partial">{{ backfill_pending_count }} {{ unit_plural }} missed it</span>
+                — retry them from the failed run below, or run it again for everyone.
+            {% endif %}
+        </p>
+    {% else %}
+        <p style="color:#666; font-size:14px;">
+            This deployment has not yet uploaded its existing pending appointments.
+            The next nightly cron job will do it automatically; use the button to
+            do it now instead. Every pending appointment is sent, whenever it was
+            booked — this takes considerably longer than a nightly run.
+        </p>
+    {% endif %}
+    <form method="post" action="{% url 'upload:backfill_upload' %}" id="backfill-form">
+        {% csrf_token %}
+        <button type="submit" class="btn {% if settings_obj.initial_backfill_done %}btn-secondary{% else %}btn-primary{% endif %}"
+                id="backfill-btn">
+            {% if settings_obj.initial_backfill_done %}Run it again{% else %}Upload all pending now{% endif %}
+        </button>
+    </form>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0">Manual Upload — All {{ unit_plural|capfirst }}</h2>
+    <p style="margin-bottom:16px; color:#666; font-size:14px;">
+        Uploads every active {{ unit }} for the selected date range.
+    </p>
+    <form method="post" action="{% url upload_url %}" id="multi-upload-form">
+        {% csrf_token %}
+        <div class="form-row">
+            <div class="form-group">
+                <label for="{{ form.date_from.id_for_label }}">From Date</label>
+                {{ form.date_from }}
+            </div>
+            <div class="form-group">
+                <label for="{{ form.date_to.id_for_label }}">To Date</label>
+                {{ form.date_to }}
+            </div>
+        </div>
+        <button type="submit" class="btn btn-primary" id="multi-upload-btn">Upload All {{ unit_plural|capfirst }}</button>
+    </form>
+
+    <div class="progress-container" id="progress-container">
+        <div class="progress-bar-wrapper">
+            <div class="progress-bar" id="progress-bar" style="width: 0%">0%</div>
+        </div>
+        <div class="progress-status" id="progress-status">Starting upload...</div>
+        <div class="roll-up" id="roll-up" style="display:none">
+            <div><strong id="count-done">0</strong> done</div>
+            <div><strong id="count-failed">0</strong> failed</div>
+            <div><strong id="count-pending">0</strong> pending</div>
+            <div><strong id="count-records">0</strong> records</div>
+        </div>
+        <button type="button" class="expand-btn" id="toggle-detail" style="margin-top:10px; display:none">
+            Show per-{{ unit }} detail
+        </button>
+        <div class="facility-progress" id="facility-progress" style="display:none"></div>
+    </div>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0">Upload History</h2>
+    {% if runs %}
+    <table>
+        <thead>
+            <tr>
+                <th></th>
+                <th>Date Range</th>
+                <th>Trigger</th>
+                <th>User</th>
+                <th>Status</th>
+                <th>{{ unit_plural|capfirst }}</th>
+                <th>Records</th>
+                <th>Time</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for run in runs %}
+            <tr>
+                <td><button type="button" class="expand-btn" data-run="{{ run.pk }}">&#9656;</button></td>
+                <td>
+                    {% if run.is_backfill %}
+                        <span class="badge badge-cron">All pending</span>
+                    {% else %}
+                        {{ run.date_from }} — {{ run.date_to }}
+                    {% endif %}
+                </td>
+                <td>
+                    <span class="badge {% if run.triggered_by == 'cron' %}badge-cron{% else %}badge-manual{% endif %}">
+                        {{ run.get_triggered_by_display }}
+                    </span>
+                </td>
+                <td>{{ run.triggered_by_user|default:"—" }}</td>
+                <td>
+                    <span class="badge badge-{{ run.status }}">{{ run.get_status_display }}</span>
+                    {% if run.retry_of_id %}<span class="muted">retry</span>{% endif %}
+                </td>
+                <td>
+                    {{ run.facilities_completed }}/{{ run.facilities_total }}
+                    {% if run.facilities_failed %}
+                        <span class="muted">({{ run.facilities_failed }} failed)</span>
+                    {% endif %}
+                </td>
+                <td>{{ run.records_uploaded }}</td>
+                <td>{{ run.created_at|date:"Y-m-d H:i" }}</td>
+                <td>
+                    {% if run.facilities_failed and not run.is_active %}
+                    <form method="post" action="{% url 'upload:run_retry_failed' run_id=run.pk %}"
+                          class="retry-form" style="display:inline">
+                        {% csrf_token %}
+                        <button type="submit" class="btn btn-secondary btn-sm">Retry failed</button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr class="detail-row" id="detail-{{ run.pk }}" style="display:none">
+                <td colspan="9"><div class="muted" style="padding:12px 0">Loading…</div></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+        <div class="empty">{{ history_empty }}</div>
+    {% endif %}
+</div>

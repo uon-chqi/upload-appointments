@@ -4,6 +4,12 @@ Facilities are independent KenyaEMR containers, each with its own MySQL, so a
 connection is opened per facility from a `FacilityConfig` rather than resolved
 from a static Django `DATABASES` alias. Nothing here goes through the ORM — the
 appointment query is raw SQL against a cursor either way.
+
+A multi-tenant cloud server is the same thing seen from the other side: one MySQL
+holding one OpenMRS schema per facility. The connection details are then shared
+and only `FacilityConfig.database` differs, which is why `database` is optional
+here — a config without one reaches the server itself, to ask which schemas it
+has (see `list_databases`).
 """
 import logging
 from contextlib import contextmanager
@@ -199,14 +205,19 @@ FROM (
 
 @dataclass(frozen=True, repr=False)
 class FacilityConfig:
-    """Everything needed to reach one facility's OpenMRS MySQL."""
+    """Everything needed to reach one facility's OpenMRS MySQL.
+
+    `database` is blank for a connection to a multi-tenant server rather than to
+    one facility on it: the server is asked which schemas exist before any of
+    them can be named.
+    """
 
     label: str
     host: str
     port: int
     user: str
     password: str
-    database: str
+    database: str = ''
     pk: Optional[int] = None
 
     def __repr__(self):
@@ -234,17 +245,24 @@ def env_config():
 
 @contextmanager
 def connect(config):
-    """Open a MySQL connection to one facility, always closing it afterwards."""
-    conn = MySQLdb.connect(
+    """Open a MySQL connection to one facility, always closing it afterwards.
+
+    A config with no `database` connects to the server without selecting a
+    schema, which is what listing a multi-tenant server's databases needs.
+    """
+    kwargs = dict(
         host=config.host,
         port=int(config.port),
         user=config.user,
         password=config.password,
-        database=config.database,
         charset='utf8mb4',
         connect_timeout=CONNECT_TIMEOUT,
         read_timeout=READ_TIMEOUT,
     )
+    if config.database:
+        kwargs['database'] = config.database
+
+    conn = MySQLdb.connect(**kwargs)
     try:
         yield conn
     finally:
@@ -421,5 +439,88 @@ def probe(config):
     result['ok'] = True
     result['message'] = 'Connected to {} (MFL {}) on MySQL {}.'.format(
         only['name'] or 'unnamed location', only['mfl'], result['mysql_version'],
+    )
+    return result
+
+
+# --------------------------------------------------------------- multi-tenant
+
+# Schemas every MySQL ships with. Excluded whatever the prefix is, so even an
+# empty prefix — "every database on this server" — lists only real candidates.
+SYSTEM_SCHEMAS = frozenset({
+    'information_schema', 'mysql', 'performance_schema', 'sys',
+})
+
+DEFAULT_DATABASE_PREFIX = 'openmrs_'
+
+
+def _matches_prefix(name, prefix):
+    """Whether a schema name is a tenant candidate under `prefix`.
+
+    Matched in Python rather than with `SHOW DATABASES LIKE`, because `_` — the
+    character a tenant prefix conventionally ends with — is a LIKE wildcard, and
+    escaping it correctly is easier to get wrong than to avoid. Case-insensitive
+    because MySQL lower-cases schema names on some platforms and not others, and
+    the operator should not have to know which.
+    """
+    if not name:
+        return False
+    lowered = name.lower()
+    return lowered not in SYSTEM_SCHEMAS and lowered.startswith((prefix or '').lower())
+
+
+def _show_databases(config):
+    """Return (mysql_version, every schema name the connecting user can see).
+
+    SHOW DATABASES is already filtered by privilege, so an account scoped to the
+    tenant schemas lists exactly those and nothing else on the box.
+    """
+    with connect(config) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT VERSION()')
+            version = _safe_str(cursor.fetchone()[0])
+            cursor.execute('SHOW DATABASES')
+            names = [_safe_str(row[0]) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+    return version, names
+
+
+def list_databases(config, prefix=DEFAULT_DATABASE_PREFIX):
+    """The schemas on a multi-tenant server whose names start with `prefix`."""
+    _, names = _show_databases(config)
+    return sorted(name for name in names if _matches_prefix(name, prefix))
+
+
+def probe_server(config, prefix=DEFAULT_DATABASE_PREFIX):
+    """Connect to a multi-tenant server and report which schemas it would cover.
+
+    The counterpart of `probe` for a whole server: it answers "can I reach this
+    MySQL, and does the prefix actually select anything?" before any facility is
+    created from it. Identifying the individual schemas is a separate step —
+    each one is asked for its own name and MFL with `probe`.
+    """
+    result = {'ok': False, 'message': '', 'databases': [], 'mysql_version': ''}
+    try:
+        version, names = _show_databases(config)
+    except Exception as exc:
+        result['message'] = 'Could not connect: {}'.format(exc)
+        return result
+
+    result['mysql_version'] = version
+    result['databases'] = sorted(n for n in names if _matches_prefix(n, prefix))
+    visible = sum(1 for n in names if n and n.lower() not in SYSTEM_SCHEMAS)
+
+    if not result['databases']:
+        result['message'] = (
+            'Connected to MySQL {}, but none of the {} database(s) this account '
+            'can see start with "{}".'.format(version, visible, prefix)
+        )
+        return result
+
+    result['ok'] = True
+    result['message'] = 'Connected to MySQL {} — {} of {} database(s) start with "{}".'.format(
+        version, len(result['databases']), visible, prefix,
     )
     return result

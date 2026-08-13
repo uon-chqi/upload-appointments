@@ -17,4 +17,14 @@ urlpatterns = [
     path('multi-facilities/facilities/<int:pk>/edit/', views.facility_save, name='facility_edit'),
     path('multi-facilities/facilities/<int:pk>/delete/', views.facility_delete, name='facility_delete'),
     path('multi-facilities/runs/<int:run_id>/retry-failed/', views.run_retry_failed, name='run_retry_failed'),
+
+    path('multi-tenant/', views.multi_tenant, name='multi_tenant'),
+    path('multi-tenant/settings/', views.tenant_settings, name='tenant_settings'),
+    path('multi-tenant/upload/', views.tenant_upload, name='tenant_upload'),
+    path('multi-tenant/servers/add/', views.tenant_server_save, name='tenant_server_add'),
+    path('multi-tenant/servers/test/', views.tenant_server_test, name='tenant_server_test'),
+    path('multi-tenant/servers/<int:pk>/edit/', views.tenant_server_save, name='tenant_server_edit'),
+    path('multi-tenant/servers/<int:pk>/delete/', views.tenant_server_delete, name='tenant_server_delete'),
+    path('multi-tenant/servers/<int:pk>/sync/', views.tenant_server_sync, name='tenant_server_sync'),
+    path('multi-tenant/databases/<int:pk>/toggle/', views.tenant_toggle, name='tenant_toggle'),
 ]

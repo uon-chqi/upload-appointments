@@ -1,13 +1,14 @@
 {% extends "upload/base.html" %}
 
-{# No link to /multi-facilities: the URL is shared directly with the clients who
-   need it. The page itself is still staff-only — this only keeps it out of sight. #}
+{# No link to /multi-facilities or /multi-tenant: those URLs are shared directly
+   with the clients who need them. The pages are still staff-only — this only
+   keeps them out of sight. #}
 
 {% block content %}
     {% if multi_enabled %}
         <div class="alert alert-info">
-            Multi-facility mode is enabled, so the nightly job uploads every configured facility.
-            Uploading from this page only covers the environment-configured facility.
+            {{ cron_mode_label }} mode is enabled, so the nightly job uploads every configured
+            facility. Uploading from this page only covers the environment-configured facility.
         </div>
     {% endif %}
 
@@ -36,7 +37,7 @@
         {% endif %}
         {% if multi_enabled %}
             <p class="help" style="margin-bottom:12px">
-                Multi-facility mode is on, so the initial upload covers every active
+                {{ cron_mode_label }} mode is on, so the initial upload covers every active
                 facility, exactly as the nightly job does.
             </p>
         {% endif %}

@@ -21,7 +21,17 @@ from .models import AppSettings, Facility, UploadLog, UploadRun
 logger = logging.getLogger(__name__)
 
 # Windows process-creation flags; the POSIX equivalent is start_new_session.
-_DETACHED_PROCESS = 0x00000008
+#
+# CREATE_NO_WINDOW, not DETACHED_PROCESS: despite reading as though it leaves the
+# child console-less, DETACHED_PROCESS makes Windows allocate the child a fresh
+# console, which appears as a blank window for as long as the upload runs (an
+# hour, at a hundred facilities). CREATE_NO_WINDOW gives a console-subsystem
+# program no console at all — measured with GetConsoleWindow(), which returns 0
+# under this flag and a live handle under DETACHED_PROCESS. Either way the child
+# is off the parent's console and outlives it; only this one is invisible.
+# The two are mutually exclusive: combining them makes Windows ignore
+# CREATE_NO_WINDOW and the window comes back.
+_CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
@@ -291,9 +301,11 @@ def create_run(date_from, date_to, triggered_by, user=None, mode='single',
     Materialising the child logs up front is what makes the progress endpoint and
     "retry failed facilities" trivial: the runner just processes the rows it finds.
     """
-    if mode == 'multi':
+    if mode in UploadRun.MULTI_MODES:
         if facilities is None:
-            facilities = list(Facility.objects.filter(is_active=True))
+            # Scoped by mode: standalone containers and discovered tenants share
+            # one table but never one run.
+            facilities = list(Facility.objects.for_mode(mode).filter(is_active=True))
         else:
             facilities = list(facilities)
     else:
@@ -363,8 +375,11 @@ def _record_backfill_done(run):
     # Only a run that covered every active facility counts as *the* initial load.
     # `--facility 7` and "retry failed" are backfills too, and neither says
     # anything about the ninety-nine containers they didn't touch.
-    if run.mode == 'multi':
-        active = set(Facility.objects.filter(is_active=True).values_list('pk', flat=True))
+    if run.mode in UploadRun.MULTI_MODES:
+        active = set(
+            Facility.objects.for_mode(run.mode)
+            .filter(is_active=True).values_list('pk', flat=True)
+        )
         covered = set(
             run.logs.exclude(facility__isnull=True).values_list('facility_id', flat=True)
         )
@@ -422,7 +437,12 @@ def execute_run(run, workers=None):
     )
     run.refresh_from_db()
 
-    logs = list(run.logs.select_related('facility').order_by('facility_label', 'pk'))
+    # facility__server too: a tenant's credentials live on its server, and
+    # fetching them lazily would be a query per facility.
+    logs = list(
+        run.logs.select_related('facility', 'facility__server')
+        .order_by('facility_label', 'pk')
+    )
     if not logs:
         run.message = 'No active facilities are configured.'
         run.save(update_fields=['message'])
@@ -553,7 +573,7 @@ def spawn_run(run_pk):
         'stderr': subprocess.DEVNULL,
     }
     if os.name == 'nt':
-        kwargs['creationflags'] = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
+        kwargs['creationflags'] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
     else:
         kwargs['start_new_session'] = True
 

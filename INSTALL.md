@@ -150,6 +150,66 @@ facilities, over the same date range.
 Only one upload may run at a time. Starting a second is refused while one is in
 flight.
 
+## Managing facilities hosted on one cloud MySQL server
+
+If the facilities are not separate containers but separate databases on a single
+MySQL server — `openmrs_kilifi`, `openmrs_malindi`, and so on — use the
+multi-tenant dashboard instead. Log in as an administrator and open:
+
+- <http://127.0.0.1:9162/multi-tenant>
+
+Nothing is entered per facility here. You give the server once, and it is asked
+what it holds.
+
+### 1. Add the server
+
+On the **Server Setup** tab, click **Add Server**:
+
+| Field | What to enter |
+|---|---|
+| Server Name | A label for your own reference. |
+| MySQL Host | The hostname or IP of the cloud MySQL server. |
+| Port | Usually `3306`. |
+| MySQL User | A user with **read access** to every facility database. |
+| MySQL Password | That user's password. Stored encrypted. |
+| Database Prefix | `openmrs_` by default. Change it if your databases are named differently; leave it blank to use every database the account can see. |
+
+Click **Test Connection** to check the prefix is selecting the databases you
+expect before saving. Saving runs the first sync straight away.
+
+### 2. Check the discovered databases
+
+Every matching database appears in the **Discovered Databases** table, with the
+facility name and MFL code read from inside it — the same values an upload would
+send. You never type these in.
+
+A database is disabled automatically, and shown as **Not identified**, when:
+
+- it has no MFL code, or no `kenyaemr.defaultLocation` set, or
+- its MFL code is already claimed by another facility, which would make the two
+  overwrite each other's data upstream.
+
+Fix these in KenyaEMR, then press **Sync** on the server to pick up the change.
+You can also enable or disable a database yourself; that choice sticks, and later
+syncs will not undo it.
+
+Press **Sync** whenever databases are added to or removed from the server. A
+database that disappears is disabled rather than deleted, so its upload history
+is kept and it comes back automatically if the database returns.
+
+### 3. Turn on multi-tenant mode
+
+Tick **Enable multi-tenant mode**. The nightly job then re-reads each server's
+database list — so facilities added on the cloud server are picked up without
+anyone touching this dashboard — and uploads every active database. Turning this
+on turns multi-facility mode off; a deployment is one or the other.
+
+### 4. Upload on demand
+
+The **Upload Data** tab works exactly as it does for multi-facility: pick a date
+range and click **Upload All Databases**, or use **Retry failed** on a partial
+run in the history table.
+
 ## Updating the service
 
 To update to the latest version later, simply re-run the installer:
@@ -189,13 +249,16 @@ OpenMRS database credentials — re-run the installer, choose `y` at the
 `Overwrite it? (y/N)` prompt, and re-enter the correct user and password.
 
 In multi-facility mode, use **Test Connection** on the facility instead: it
-reports exactly why a container is unreachable.
+reports exactly why a container is unreachable. In multi-tenant mode, use
+**Test Connection** on the server, then **Sync** to see which databases could
+not be identified.
 
 **`Stored credential could not be decrypted`**
 The `FIELD_ENCRYPTION_KEY` in `/opt/upload-appointments/.env` changed, so the
 saved facility passwords can no longer be read. Re-enter the password for each
-affected facility on the Facility Setup tab. Never delete or regenerate that key
-on a server that has facilities configured.
+affected facility on the Facility Setup tab, or for each server on the Server
+Setup tab. Never delete or regenerate that key on a server that has facilities
+configured.
 
 **An upload is stuck and blocks new ones**
 A run whose process was killed (for example by a server restart) is detected and

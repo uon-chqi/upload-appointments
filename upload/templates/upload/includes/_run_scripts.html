@@ -1,0 +1,204 @@
+{% comment %}
+Drives _run_panel.html: starting a run, polling it, and expanding history.
+
+Exposes window.runPanel so a page can react without this file knowing anything
+about that page — the multi-facility and multi-tenant pages both use it to show
+their upload tab when a retry starts. Include after _run_panel.html and before
+any page script that sets runPanel.onRetry.
+{% endcomment %}
+<script>
+window.runPanel = (function() {
+    const progressUrl = '{% url "upload:run_progress" run_id=0 %}';
+    const unitPlural = '{{ unit_plural|escapejs }}';
+
+    const uploadForm = document.getElementById('multi-upload-form');
+    const uploadBtn = document.getElementById('multi-upload-btn');
+    const container = document.getElementById('progress-container');
+    const bar = document.getElementById('progress-bar');
+    const status = document.getElementById('progress-status');
+    const rollUp = document.getElementById('roll-up');
+    const detailToggle = document.getElementById('toggle-detail');
+    const detail = document.getElementById('facility-progress');
+
+    const api = {onRetry: null};
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text == null ? '' : text;
+        return div.innerHTML;
+    }
+
+    detailToggle.addEventListener('click', function() {
+        const open = detail.style.display !== 'none';
+        detail.style.display = open ? 'none' : 'block';
+        detailToggle.textContent = open ? 'Show detail' : 'Hide detail';
+    });
+
+    // Both the dated upload and the initial backfill drive the same progress
+    // panel; only the button that started the run gets re-enabled at the end.
+    let activeBtn = uploadBtn;
+    let activeLabel = uploadBtn.textContent;
+
+    function showProgress() {
+        container.style.display = 'block';
+        rollUp.style.display = 'flex';
+        detailToggle.style.display = 'inline-block';
+    }
+
+    function submitUpload(form, btn, confirmMessage) {
+        return function(e) {
+            e.preventDefault();
+            if (confirmMessage && !confirm(confirmMessage)) { return; }
+            activeBtn = btn;
+            activeLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Uploading...';
+            showProgress();
+            bar.style.width = '0%';
+            bar.textContent = '0%';
+            bar.style.background = '#3498db';
+            status.textContent = 'Starting upload...';
+            status.className = 'progress-status';
+            container.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+
+            fetch(form.action, {
+                method: 'POST',
+                body: new FormData(form),
+                headers: {'X-Requested-With': 'XMLHttpRequest'},
+            })
+            .then(function(resp) { return resp.json().then(function(d) { return {ok: resp.ok, data: d}; }); })
+            .then(function(result) {
+                if (!result.ok) {
+                    finish(result.data.error || 'Could not start upload.', 'status-failed');
+                    return;
+                }
+                poll(result.data.run_id);
+            })
+            .catch(function(err) { finish('Error starting upload: ' + err, 'status-failed'); });
+        };
+    }
+
+    uploadForm.addEventListener('submit', submitUpload(uploadForm, uploadBtn));
+
+    const backfillForm = document.getElementById('backfill-form');
+    const backfillBtn = document.getElementById('backfill-btn');
+    if (backfillForm) {
+        backfillForm.addEventListener('submit', submitUpload(
+            backfillForm, backfillBtn,
+            'Upload every pending appointment for all active ' + unitPlural + '? ' +
+            'This can take considerably longer than a nightly run.'
+        ));
+    }
+
+    function finish(message, cls) {
+        status.textContent = message;
+        status.className = 'progress-status ' + (cls || '');
+        activeBtn.disabled = false;
+        activeBtn.textContent = activeLabel;
+    }
+
+    function poll(runId) {
+        const url = progressUrl.replace('/0/', '/' + runId + '/');
+        const interval = setInterval(function() {
+            fetch(url)
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                render(data);
+                if (['success', 'partial', 'failed'].indexOf(data.status) === -1) { return; }
+
+                clearInterval(interval);
+                if (data.status === 'success') {
+                    bar.style.background = '#28a745';
+                    finish('Upload complete — ' + data.records_uploaded + ' records across ' +
+                           data.facilities_total + ' ' + unitPlural + '.', 'status-success');
+                } else if (data.status === 'partial') {
+                    bar.style.background = '#f0ad4e';
+                    finish(data.facilities_failed + ' of ' + data.facilities_total + ' ' +
+                           unitPlural + ' failed. Use "Retry failed" below once the page reloads.',
+                           'status-partial');
+                } else {
+                    bar.style.background = '#dc3545';
+                    finish('Upload failed: ' + (data.message || 'everything failed.'), 'status-failed');
+                }
+                setTimeout(function() { location.hash = '#upload'; location.reload(); }, 2500);
+            })
+            .catch(function() {});
+        }, 2000);
+    }
+
+    function render(data) {
+        // Overall progress is targets finished, not batches: batches are not
+        // comparable across facilities of wildly different sizes.
+        const total = data.facilities_total || 1;
+        const pct = Math.round((data.facilities_completed / total) * 100);
+        bar.style.width = pct + '%';
+        bar.textContent = pct + '%';
+
+        const done = data.facilities.filter(function(f) { return f.status === 'success'; }).length;
+        const failed = data.facilities.filter(function(f) { return f.status === 'failed'; }).length;
+        document.getElementById('count-done').textContent = done;
+        document.getElementById('count-failed').textContent = failed;
+        document.getElementById('count-pending').textContent = total - done - failed;
+        document.getElementById('count-records').textContent = data.records_uploaded;
+
+        if (data.status === 'in_progress') {
+            status.textContent = 'Uploading ' + data.facilities_completed + ' of ' +
+                total + ' ' + unitPlural + '…';
+        }
+        detail.innerHTML = data.facilities.map(facilityRow).join('');
+    }
+
+    function facilityRow(f) {
+        const pct = f.batches_total ? Math.round((f.batches_completed / f.batches_total) * 100)
+                                    : (f.status === 'success' ? 100 : 0);
+        return '<div class="facility-row status-' + f.status + '">' +
+            '<span class="name">' + escapeHtml(f.label) + '</span>' +
+            '<span class="mini-bar"><span style="width:' + pct + '%"></span></span>' +
+            '<span class="badge badge-' + f.status + '">' + f.status.replace('_', ' ') + '</span>' +
+            '<span class="muted">' + f.records_uploaded + ' rec</span>' +
+            (f.error_message ? '<span class="error-text" title="' + escapeHtml(f.error_message) + '">error</span>' : '') +
+            '</div>';
+    }
+
+    /* ------------------------- history expansion -------------------------- */
+    document.querySelectorAll('.expand-btn[data-run]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const runId = btn.dataset.run;
+            const row = document.getElementById('detail-' + runId);
+            const open = row.style.display !== 'none';
+            row.style.display = open ? 'none' : 'table-row';
+            btn.innerHTML = open ? '&#9656;' : '&#9662;';
+            if (open || row.dataset.loaded) { return; }
+
+            fetch(progressUrl.replace('/0/', '/' + runId + '/'))
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                row.dataset.loaded = '1';
+                row.querySelector('td').innerHTML =
+                    '<div class="facility-progress" style="display:block; max-height:none">' +
+                    data.facilities.map(facilityRow).join('') + '</div>';
+            });
+        });
+    });
+
+    document.querySelectorAll('.retry-form').forEach(function(form) {
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            fetch(form.action, {method: 'POST', body: new FormData(form)})
+            .then(function(resp) { return resp.json().then(function(d) { return {ok: resp.ok, data: d}; }); })
+            .then(function(result) {
+                if (!result.ok) { alert(result.data.error); return; }
+                if (api.onRetry) { api.onRetry(); }
+                showProgress();
+                uploadBtn.disabled = true;
+                poll(result.data.run_id);
+            });
+        });
+    });
+
+    api.poll = poll;
+    api.showProgress = showProgress;
+    api.escapeHtml = escapeHtml;
+    return api;
+})();
+</script>

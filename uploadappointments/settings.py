@@ -164,6 +164,11 @@ UPLOAD_BATCH_SIZE = int(os.environ.get('UPLOAD_BATCH_SIZE', '10'))
 # MySQL), so this is the one number to tune. Conservative until its rate limit
 # is known: 100 facilities at ~2 minutes each finishes in roughly 40 minutes.
 MULTI_FACILITY_WORKERS = int(os.environ.get('MULTI_FACILITY_WORKERS', '5'))
+# Concurrency for identifying multi-tenant schemas. Separate from the upload
+# workers above because the bottleneck is different: a probe is two indexed
+# queries against the tenant server's own MySQL, with no central API involved,
+# so it can run wider without anyone else feeling it.
+TENANT_PROBE_WORKERS = int(os.environ.get('TENANT_PROBE_WORKERS', '8'))
 # A run whose heartbeat goes quiet for this long is assumed dead.
 UPLOAD_STALE_MINUTES = int(os.environ.get('UPLOAD_STALE_MINUTES', '20'))
 

@@ -10,8 +10,8 @@ from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from upload import crypto, openmrs, services
-from upload.models import AppSettings, Facility, UploadLog, UploadRun
+from upload import crypto, openmrs, services, tenants
+from upload.models import AppSettings, Facility, TenantServer, UploadLog, UploadRun
 
 
 def make_response(status_code=200, json_data=None, headers=None, text=''):
@@ -700,6 +700,41 @@ class ViewTests(TestCase):
         mock_spawn.assert_called_once()
 
 
+class SpawnRunTests(SimpleTestCase):
+    """How the upload subprocess is detached, per platform."""
+
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NO_WINDOW = 0x08000000
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+    def spawn_as(self, os_name):
+        with mock.patch('upload.services.os.name', os_name), \
+                mock.patch('upload.services.subprocess.Popen') as popen:
+            services.spawn_run(7)
+        return popen.call_args
+
+    def test_windows_gets_no_console_window(self):
+        flags = self.spawn_as('nt').kwargs['creationflags']
+
+        self.assertTrue(flags & self.CREATE_NO_WINDOW)
+        self.assertTrue(flags & self.CREATE_NEW_PROCESS_GROUP)
+        # DETACHED_PROCESS reads as though it suppresses the console but in fact
+        # allocates a new one — a blank window for the length of the upload — and
+        # combining the two makes Windows ignore CREATE_NO_WINDOW entirely.
+        self.assertFalse(flags & self.DETACHED_PROCESS)
+
+    def test_posix_gets_its_own_session_instead(self):
+        call = self.spawn_as('posix')
+
+        self.assertTrue(call.kwargs['start_new_session'])
+        self.assertNotIn('creationflags', call.kwargs)
+
+    def test_the_child_is_told_which_run_to_execute(self):
+        command = self.spawn_as('posix').args[0]
+
+        self.assertEqual(command[-3:], ['upload_appointments', '--run-id', '7'])
+
+
 @override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility')
 class ExecuteRunTests(TestCase):
     def test_facility_with_an_undecryptable_password_fails_without_blocking_the_rest(self):
@@ -948,3 +983,707 @@ class AppSettingsTests(TestCase):
 
         self.assertEqual(AppSettings.objects.count(), 1)
         self.assertFalse(AppSettings.load().multi_facility_enabled)
+
+    def test_cron_mode_reflects_the_enabled_flag(self):
+        settings_obj = AppSettings.load()
+        self.assertEqual(settings_obj.cron_mode(), 'single')
+
+        settings_obj.multi_facility_enabled = True
+        self.assertEqual(settings_obj.cron_mode(), 'multi')
+
+        settings_obj.multi_tenant_enabled = True
+        # Both set is not reachable through the UI, but it must still resolve to
+        # one mode rather than uploading twice or not at all.
+        self.assertEqual(settings_obj.cron_mode(), 'tenant')
+
+
+# ------------------------------------------------------------------ multi-tenant
+
+def probe_result(mfl='', name='', ok=None, message=''):
+    """A canned openmrs.probe() return value."""
+    ok = bool(mfl) if ok is None else ok
+    return {
+        'ok': ok,
+        'message': message or ('Connected' if ok else 'no MFL code'),
+        'mfl': mfl,
+        'facility_name': name,
+        'candidates': [],
+        'mysql_version': '8.0.35',
+    }
+
+
+class ListDatabasesTests(SimpleTestCase):
+    config = openmrs.FacilityConfig(
+        label='Cloud', host='h', port=3306, user='u', password='p',
+    )
+
+    class Cursor:
+        def __init__(self, names):
+            self.names = names
+            self._rows = ()
+
+        def execute(self, sql, params=None):
+            self._rows = (('8.0.35',),) if 'VERSION()' in sql else tuple(
+                (n,) for n in self.names
+            )
+
+        def fetchone(self):
+            return self._rows[0]
+
+        def fetchall(self):
+            return self._rows
+
+        def close(self):
+            pass
+
+    def with_databases(self, names):
+        conn = mock.Mock()
+        conn.cursor.return_value = self.Cursor(names)
+
+        @contextmanager
+        def fake_connect(config):
+            yield conn
+
+        return mock.patch.object(openmrs, 'connect', fake_connect)
+
+    def test_the_prefix_selects_tenants_and_never_system_schemas(self):
+        with self.with_databases([
+            'information_schema', 'mysql', 'performance_schema', 'sys',
+            'openmrs_kilifi', 'openmrs_malindi', 'wordpress', 'openmrs',
+        ]):
+            found = openmrs.list_databases(self.config, 'openmrs_')
+
+        # 'openmrs' itself is short of the prefix; the underscore is matched as a
+        # literal, not as the LIKE wildcard it would be in SQL.
+        self.assertEqual(found, ['openmrs_kilifi', 'openmrs_malindi'])
+
+    def test_an_empty_prefix_means_everything_except_the_system_schemas(self):
+        with self.with_databases(['mysql', 'sys', 'openmrs_kilifi', 'wordpress']):
+            self.assertEqual(
+                openmrs.list_databases(self.config, ''),
+                ['openmrs_kilifi', 'wordpress'],
+            )
+
+    def test_prefix_matching_ignores_case(self):
+        # MySQL lower-cases schema names on some platforms and not others.
+        with self.with_databases(['OpenMRS_Kilifi']):
+            self.assertEqual(
+                openmrs.list_databases(self.config, 'openmrs_'), ['OpenMRS_Kilifi'],
+            )
+
+    def test_probe_server_reports_a_prefix_that_matches_nothing(self):
+        with self.with_databases(['mysql', 'wordpress']):
+            result = openmrs.probe_server(self.config, 'openmrs_')
+
+        self.assertFalse(result['ok'])
+        self.assertIn('none of the 1 database(s)', result['message'])
+
+    def test_probe_server_reports_what_it_found(self):
+        with self.with_databases(['openmrs_a', 'openmrs_b', 'wordpress']):
+            result = openmrs.probe_server(self.config, 'openmrs_')
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['databases'], ['openmrs_a', 'openmrs_b'])
+        self.assertIn('2 of 3', result['message'])
+
+    def test_a_connection_failure_is_reported_not_raised(self):
+        @contextmanager
+        def boom(config):
+            raise OSError('connection refused')
+            yield  # pragma: no cover
+
+        with mock.patch.object(openmrs, 'connect', boom):
+            result = openmrs.probe_server(self.config, 'openmrs_')
+
+        self.assertFalse(result['ok'])
+        self.assertIn('Could not connect', result['message'])
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', TENANT_PROBE_WORKERS=1)
+class TenantSyncTests(TestCase):
+    """Reconciling one server's schema list into Facility rows."""
+
+    def setUp(self):
+        self.server = TenantServer.objects.create(
+            name='Cloud', host='cloud.example', username='readonly',
+            database_prefix='openmrs_',
+        )
+        self.server.set_password('pw')
+        self.server.save()
+
+    def sync(self, databases, probes=None, **kwargs):
+        probes = probes or {}
+        with mock.patch.object(openmrs, 'list_databases', return_value=databases), \
+                mock.patch.object(
+                    openmrs, 'probe',
+                    side_effect=lambda config: probes.get(config.database, probe_result()),
+                ):
+            return tenants.sync_server(self.server, **kwargs)
+
+    def test_schemas_become_facilities_named_by_what_they_report(self):
+        summary = self.sync(
+            ['openmrs_kilifi', 'openmrs_malindi'],
+            {
+                'openmrs_kilifi': probe_result('12345', 'Kilifi Dispensary'),
+                'openmrs_malindi': probe_result('67890', 'Malindi Health Centre'),
+            },
+        )
+
+        self.assertTrue(summary['ok'])
+        self.assertEqual(summary['added'], 2)
+        kilifi = Facility.objects.get(database_name='openmrs_kilifi')
+        self.assertEqual(kilifi.name, 'Kilifi Dispensary')
+        self.assertEqual(kilifi.mfl_code, '12345')
+        self.assertEqual(kilifi.server, self.server)
+        self.assertTrue(kilifi.is_active)
+        self.assertIsNotNone(kilifi.last_seen_at)
+
+    def test_a_tenant_connects_through_its_server_not_its_own_row(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        config = Facility.objects.get(database_name='openmrs_kilifi').as_config()
+        self.assertEqual(config.host, 'cloud.example')
+        self.assertEqual(config.user, 'readonly')
+        self.assertEqual(config.password, 'pw')
+        self.assertEqual(config.database, 'openmrs_kilifi')
+
+    def test_editing_the_server_password_reaches_every_tenant_at_once(self):
+        self.sync(['openmrs_a', 'openmrs_b'], {
+            'openmrs_a': probe_result('1', 'A'), 'openmrs_b': probe_result('2', 'B'),
+        })
+        self.server.set_password('rotated')
+        self.server.save()
+
+        for facility in Facility.objects.tenants().select_related('server'):
+            self.assertEqual(facility.as_config().password, 'rotated')
+
+    def test_a_schema_that_cannot_be_identified_is_created_disabled(self):
+        summary = self.sync(
+            ['openmrs_broken'],
+            {'openmrs_broken': probe_result(message='no default location set')},
+        )
+
+        self.assertEqual(summary['unidentified'], 1)
+        self.assertEqual(len(summary['problems']), 1)
+        facility = Facility.objects.get(database_name='openmrs_broken')
+        # Uploading under a blank MFL would be rejected upstream, so it is kept
+        # visible but out of the run.
+        self.assertFalse(facility.is_active)
+        self.assertTrue(facility.disabled_by_sync)
+        self.assertEqual(facility.mfl_code, '')
+        self.assertEqual(facility.name, 'openmrs_broken')
+
+    def test_a_probe_failure_takes_the_mfl_but_leaves_the_reported_name(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result(message='down')})
+
+        facility = Facility.objects.get(database_name='openmrs_kilifi')
+        self.assertEqual(facility.mfl_code, '')
+        self.assertFalse(facility.is_active)
+        self.assertEqual(facility.mfl_facility_name, 'Kilifi')
+
+    def test_a_recovered_facility_follows_a_rename_upstream(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result(message='down')})
+
+        self.sync(
+            ['openmrs_kilifi'],
+            {'openmrs_kilifi': probe_result('12345', 'Kilifi Sub-District')},
+        )
+
+        facility = Facility.objects.get(database_name='openmrs_kilifi')
+        self.assertEqual(facility.name, 'Kilifi Sub-District')
+        self.assertTrue(facility.is_active)
+
+    def test_a_duplicate_mfl_disables_the_second_schema_rather_than_overwriting(self):
+        Facility.objects.create(name='Kilifi Container', host='k', username='u',
+                                password_encrypted='x', mfl_code='12345')
+
+        summary = self.sync(
+            ['openmrs_clone'], {'openmrs_clone': probe_result('12345', 'Kilifi Clone')},
+        )
+
+        self.assertEqual(summary['unidentified'], 1)
+        self.assertIn('already used by "Kilifi Container"', summary['problems'][0])
+        clone = Facility.objects.get(database_name='openmrs_clone')
+        self.assertEqual(clone.mfl_code, '')
+        self.assertFalse(clone.is_active)
+
+    def test_two_schemas_claiming_one_mfl_do_not_both_upload(self):
+        summary = self.sync(['openmrs_a', 'openmrs_b'], {
+            'openmrs_a': probe_result('12345', 'Kilifi'),
+            'openmrs_b': probe_result('12345', 'Kilifi'),
+        })
+
+        self.assertEqual(summary['unidentified'], 1)
+        self.assertEqual(Facility.objects.filter(mfl_code='12345').count(), 1)
+        self.assertEqual(Facility.objects.tenants().filter(is_active=True).count(), 1)
+
+    def test_a_schema_that_disappears_is_deactivated_not_deleted(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        summary = self.sync([])
+
+        self.assertEqual(summary['disappeared'], 1)
+        facility = Facility.objects.get(database_name='openmrs_kilifi')
+        self.assertFalse(facility.is_active)
+        self.assertTrue(facility.disabled_by_sync)
+        self.assertIn('no longer on Cloud', facility.last_test_message)
+
+    def test_a_schema_that_comes_back_is_re_enabled(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        self.sync([])
+
+        summary = self.sync(
+            ['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')},
+        )
+
+        self.assertEqual(summary['reappeared'], 1)
+        facility = Facility.objects.get(database_name='openmrs_kilifi')
+        self.assertTrue(facility.is_active)
+        self.assertFalse(facility.disabled_by_sync)
+
+    def test_a_renamed_schema_can_hand_its_mfl_to_its_replacement(self):
+        self.sync(['openmrs_old'], {'openmrs_old': probe_result('12345', 'Kilifi')})
+
+        # The same facility, moved to a new schema name. The retired row must
+        # release the MFL in the same sync or the new one cannot claim it.
+        summary = self.sync(['openmrs_new'], {'openmrs_new': probe_result('12345', 'Kilifi')})
+
+        self.assertEqual(summary['problems'], [])
+        self.assertEqual(
+            Facility.objects.get(database_name='openmrs_new').mfl_code, '12345',
+        )
+        self.assertEqual(Facility.objects.get(database_name='openmrs_old').mfl_code, '')
+
+    def test_a_facility_switched_off_by_hand_stays_off(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        Facility.objects.update(is_active=False, disabled_by_sync=False)
+
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        self.assertFalse(Facility.objects.get(database_name='openmrs_kilifi').is_active)
+
+    def test_a_hand_picked_name_survives_later_syncs(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        Facility.objects.update(name='Kilifi — north wing')
+
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        self.assertEqual(
+            Facility.objects.get(database_name='openmrs_kilifi').name,
+            'Kilifi — north wing',
+        )
+
+    def test_a_failed_probe_does_not_rename_an_identified_facility(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result(message='down')})
+
+        # Reverting to the schema name because the container was briefly down
+        # would be churn, not information.
+        self.assertEqual(
+            Facility.objects.get(database_name='openmrs_kilifi').name, 'Kilifi',
+        )
+
+    def test_two_schemas_reporting_the_same_name_are_told_apart(self):
+        self.sync(['openmrs_a', 'openmrs_b'], {
+            'openmrs_a': probe_result('1', 'Health Centre'),
+            'openmrs_b': probe_result('2', 'Health Centre'),
+        })
+
+        self.assertEqual(
+            sorted(Facility.objects.values_list('name', flat=True)),
+            ['Health Centre', 'Health Centre (openmrs_b)'],
+        )
+
+    def test_an_unreachable_server_changes_nothing_and_says_so(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        with mock.patch.object(openmrs, 'list_databases',
+                               side_effect=OSError('connection refused')):
+            summary = tenants.sync_server(self.server)
+
+        self.assertFalse(summary['ok'])
+        self.assertIn('Could not list databases', summary['message'])
+        # Last night's list is a better basis than no list at all.
+        self.assertTrue(Facility.objects.get(database_name='openmrs_kilifi').is_active)
+        self.server.refresh_from_db()
+        self.assertFalse(self.server.last_sync_ok)
+
+    def test_no_reprobe_only_identifies_what_is_new_or_still_unknown(self):
+        self.sync(['openmrs_known'], {'openmrs_known': probe_result('12345', 'Known')})
+
+        probes = {
+            'openmrs_known': probe_result('12345', 'Known'),
+            'openmrs_fresh': probe_result('67890', 'Fresh'),
+        }
+        with mock.patch.object(openmrs, 'list_databases',
+                               return_value=['openmrs_known', 'openmrs_fresh']), \
+                mock.patch.object(
+                    openmrs, 'probe',
+                    side_effect=lambda c: probes[c.database],
+                ) as probe:
+            tenants.sync_server(self.server, reprobe=False)
+
+        self.assertEqual([c.args[0].database for c in probe.call_args_list],
+                         ['openmrs_fresh'])
+        self.assertEqual(Facility.objects.count(), 2)
+
+    def test_sync_all_covers_active_servers_only(self):
+        TenantServer.objects.create(name='Retired', host='r', username='u',
+                                    password_encrypted='x', is_active=False)
+        with mock.patch.object(tenants, 'sync_server', return_value={'ok': True}) as sync:
+            results = tenants.sync_all()
+
+        self.assertEqual([r[0].name for r in results], ['Cloud'])
+        self.assertEqual(sync.call_count, 1)
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility')
+class FacilityModeScopingTests(TestCase):
+    """Standalone containers and discovered tenants share a table, never a run."""
+
+    def setUp(self):
+        self.server = TenantServer.objects.create(
+            name='Cloud', host='cloud', username='u', password_encrypted='x',
+        )
+        self.standalone = Facility.objects.create(
+            name='Kilifi Container', host='k', username='u', password_encrypted='x',
+        )
+        self.tenant = Facility.objects.create(
+            name='Malindi Tenant', host='cloud', username='u', server=self.server,
+            database_name='openmrs_malindi',
+        )
+
+    def test_querysets_split_the_two_setups(self):
+        self.assertEqual([f.pk for f in Facility.objects.standalone()], [self.standalone.pk])
+        self.assertEqual([f.pk for f in Facility.objects.tenants()], [self.tenant.pk])
+        self.assertEqual(list(Facility.objects.for_mode('multi')),
+                         list(Facility.objects.standalone()))
+        self.assertEqual(list(Facility.objects.for_mode('tenant')),
+                         list(Facility.objects.tenants()))
+
+    def test_for_mode_refuses_a_mode_that_has_no_facilities(self):
+        with self.assertRaises(ValueError):
+            Facility.objects.for_mode('single')
+
+    def test_a_multi_facility_run_does_not_sweep_in_tenants(self):
+        run = services.create_run(date(2026, 1, 1), date(2026, 1, 2),
+                                  triggered_by='cron', mode='multi')
+
+        self.assertEqual([log.facility_label for log in run.logs.all()],
+                         ['Kilifi Container'])
+
+    def test_a_tenant_run_does_not_sweep_in_standalone_facilities(self):
+        run = services.create_run(date(2026, 1, 1), date(2026, 1, 2),
+                                  triggered_by='cron', mode='tenant')
+
+        self.assertEqual([log.facility_label for log in run.logs.all()],
+                         ['Malindi Tenant'])
+
+    def test_a_tenant_backfill_does_not_wait_on_standalone_facilities(self):
+        # Deployment-wide "initial load done" is judged against the facilities
+        # the run's own mode targets, not every row in the table.
+        run = services.create_run(date(2026, 8, 5), date(2026, 8, 5),
+                                  triggered_by='cron', mode='tenant', is_backfill=True)
+        run.logs.update(status='success')
+
+        services._finalize_run(run)
+
+        self.assertTrue(AppSettings.load().initial_backfill_done)
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility',
+                   TENANT_PROBE_WORKERS=1)
+class MultiTenantViewTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.staff = User.objects.create_user('admin', password='pw', is_staff=True)
+        self.plain = User.objects.create_user('nurse', password='pw')
+        self.client.force_login(self.staff)
+
+    def _server(self, name='Cloud'):
+        server = TenantServer.objects.create(name=name, host='cloud', username='u')
+        server.set_password('pw')
+        server.save()
+        return server
+
+    def _tenant(self, server, database='openmrs_kilifi', name='Kilifi', mfl='12345'):
+        return Facility.objects.create(
+            name=name, host='cloud', username='u', server=server,
+            database_name=database, mfl_code=mfl,
+        )
+
+    def test_the_page_is_staff_only(self):
+        self.client.force_login(self.plain)
+        self.assertEqual(self.client.get(reverse('upload:multi_tenant')).status_code, 302)
+
+        self.client.force_login(self.staff)
+        self.assertEqual(self.client.get(reverse('upload:multi_tenant')).status_code, 200)
+
+    def test_each_page_wires_the_shared_run_panel_to_its_own_endpoint(self):
+        # The upload panel and its script are one include shared by both pages;
+        # pointing either at the other's endpoint would upload the wrong set.
+        pages = {
+            'upload:multi_facilities': 'upload:multi_upload',
+            'upload:multi_tenant': 'upload:tenant_upload',
+        }
+        for page, upload_url in pages.items():
+            with self.subTest(page=page):
+                response = self.client.get(reverse(page))
+                html = response.content.decode()
+                self.assertIn(
+                    'action="{}" id="multi-upload-form"'.format(reverse(upload_url)), html,
+                )
+                self.assertIn('id="backfill-form"', html)
+                self.assertIn('window.runPanel', html)
+                # {% include %} without `only`, so the forms inside still get a
+                # CSRF token from the request context.
+                self.assertIn('name="csrfmiddlewaretoken"', html)
+                # The page-specific script leans on the shared one being there.
+                self.assertLess(html.index('window.runPanel'), html.index('runPanel.onRetry'))
+
+    def test_the_facility_modal_still_belongs_to_the_multi_facility_page_alone(self):
+        response = self.client.get(reverse('upload:multi_facilities'))
+        self.assertContains(response, 'id="facility-modal"')
+        self.assertNotContains(response, 'id="server-modal"')
+
+        response = self.client.get(reverse('upload:multi_tenant'))
+        self.assertContains(response, 'id="server-modal"')
+        self.assertNotContains(response, 'id="facility-modal"')
+
+    def test_saving_a_server_discovers_its_databases_straight_away(self):
+        with mock.patch('upload.views.tenants.sync_server') as sync:
+            sync.return_value = {'ok': True, 'message': '2 database(s) found.'}
+            response = self.client.post(reverse('upload:tenant_server_add'), {
+                'name': 'Cloud', 'host': 'cloud', 'port': '3306', 'username': 'u',
+                'password': 'pw', 'database_prefix': 'openmrs_', 'is_active': 'on',
+            })
+
+        self.assertEqual(response.status_code, 302)
+        server = TenantServer.objects.get()
+        self.assertEqual(server.get_password(), 'pw')
+        sync.assert_called_once_with(server)
+
+    def test_adding_a_server_requires_a_password(self):
+        response = self.client.post(reverse('upload:tenant_server_add'), {
+            'name': 'Cloud', 'host': 'cloud', 'port': '3306', 'username': 'u',
+            'password': '', 'database_prefix': 'openmrs_',
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(TenantServer.objects.exists())
+        # The errors live inside the modal, so it has to come back open.
+        self.assertContains(response, 'modal-backdrop open', status_code=400)
+
+    def test_editing_a_server_without_retyping_the_password_keeps_it(self):
+        server = self._server()
+
+        with mock.patch('upload.views.tenants.sync_server',
+                        return_value={'ok': True, 'message': 'done'}):
+            response = self.client.post(
+                reverse('upload:tenant_server_edit', kwargs={'pk': server.pk}),
+                {'name': 'Cloud', 'host': 'new-host', 'port': '3307', 'username': 'u',
+                 'password': '', 'database_prefix': 'openmrs_', 'is_active': 'on'},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        server.refresh_from_db()
+        self.assertEqual(server.host, 'new-host')
+        self.assertEqual(server.get_password(), 'pw')
+
+    def test_deleting_a_server_takes_its_databases_but_leaves_the_history(self):
+        server = self._server()
+        facility = self._tenant(server)
+        run = services.create_run(date(2026, 1, 1), date(2026, 1, 2),
+                                  triggered_by='manual', mode='tenant',
+                                  facilities=[facility])
+
+        self.client.post(reverse('upload:tenant_server_delete', kwargs={'pk': server.pk}))
+
+        self.assertFalse(Facility.objects.exists())
+        log = run.logs.get()
+        self.assertIsNone(log.facility_id)
+        self.assertEqual(log.facility_label, 'Kilifi')
+
+    def test_toggling_a_database_overrides_sync_for_good(self):
+        server = self._server()
+        facility = self._tenant(server)
+        Facility.objects.filter(pk=facility.pk).update(
+            is_active=False, disabled_by_sync=True,
+        )
+
+        self.client.post(reverse('upload:tenant_toggle', kwargs={'pk': facility.pk}))
+
+        facility.refresh_from_db()
+        self.assertTrue(facility.is_active)
+        self.assertFalse(facility.disabled_by_sync)
+
+    def test_the_facility_form_cannot_reach_a_discovered_database(self):
+        facility = self._tenant(self._server())
+
+        response = self.client.post(
+            reverse('upload:facility_edit', kwargs={'pk': facility.pk}),
+            {'name': 'Hijacked', 'host': 'elsewhere', 'port': '3306',
+             'database_name': 'openmrs', 'username': 'u', 'password': 'pw'},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        facility.refresh_from_db()
+        self.assertEqual(facility.host, 'cloud')
+
+    def test_the_multi_facility_page_does_not_list_tenants(self):
+        self._tenant(self._server())
+        Facility.objects.create(name='Standalone', host='s', username='u',
+                                password_encrypted='x')
+
+        response = self.client.get(reverse('upload:multi_facilities'))
+
+        self.assertEqual([f.name for f in response.context['facilities']], ['Standalone'])
+
+    @mock.patch('upload.services.spawn_run')
+    def test_a_tenant_upload_covers_the_discovered_databases(self, mock_spawn):
+        server = self._server()
+        self._tenant(server, 'openmrs_kilifi', 'Kilifi', '1')
+        Facility.objects.create(name='Standalone', host='s', username='u',
+                                password_encrypted='x')
+
+        response = self.client.post(reverse('upload:tenant_upload'),
+                                    {'date_from': '2026-01-01', 'date_to': '2026-01-02'})
+
+        self.assertEqual(response.status_code, 200)
+        run = UploadRun.objects.get(pk=response.json()['run_id'])
+        self.assertEqual(run.mode, 'tenant')
+        self.assertEqual([log.facility_label for log in run.logs.all()], ['Kilifi'])
+
+    @mock.patch('upload.services.spawn_run')
+    def test_a_tenant_upload_with_nothing_discovered_says_so(self, mock_spawn):
+        response = self.client.post(reverse('upload:tenant_upload'),
+                                    {'date_from': '2026-01-01', 'date_to': '2026-01-02'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('No active tenant databases', response.json()['error'])
+        mock_spawn.assert_not_called()
+
+    @mock.patch('upload.services.spawn_run')
+    def test_retrying_a_tenant_run_stays_a_tenant_run(self, mock_spawn):
+        facility = self._tenant(self._server())
+        run = services.create_run(date(2026, 1, 1), date(2026, 1, 2), triggered_by='manual',
+                                  mode='tenant', facilities=[facility])
+        run.logs.update(status='failed')
+        UploadRun.objects.filter(pk=run.pk).update(status='failed', facilities_failed=1)
+
+        response = self.client.post(
+            reverse('upload:run_retry_failed', kwargs={'run_id': run.pk}),
+        )
+
+        retry = UploadRun.objects.get(pk=response.json()['run_id'])
+        self.assertEqual(retry.mode, 'tenant')
+
+    def test_enabling_one_mode_disables_the_other(self):
+        self.client.post(reverse('upload:multi_settings'), {'multi_facility_enabled': 'on'})
+        self.assertEqual(AppSettings.load().cron_mode(), 'multi')
+
+        self.client.post(reverse('upload:tenant_settings'), {'multi_tenant_enabled': 'on'})
+
+        app_settings = AppSettings.load()
+        self.assertFalse(app_settings.multi_facility_enabled)
+        self.assertEqual(app_settings.cron_mode(), 'tenant')
+
+    def test_server_test_reports_the_matching_databases_without_saving(self):
+        with mock.patch('upload.views.openmrs.probe_server') as probe:
+            probe.return_value = {
+                'ok': True, 'message': 'Connected', 'mysql_version': '8.0',
+                'databases': ['openmrs_{}'.format(i) for i in range(30)],
+            }
+            response = self.client.post(reverse('upload:tenant_server_test'), {
+                'name': 'Cloud', 'host': 'cloud', 'port': '3306', 'username': 'u',
+                'password': 'pw', 'database_prefix': 'openmrs_',
+            })
+
+        data = response.json()
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['count'], 30)
+        # A hundred names is not something to paste into an alert box.
+        self.assertEqual(len(data['sample']), 20)
+        self.assertFalse(TenantServer.objects.exists())
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility')
+class UploadCommandTenantTests(TestCase):
+    """What the nightly cron job does when multi-tenant mode is on."""
+
+    def setUp(self):
+        patcher = mock.patch('upload.services.execute_run', side_effect=self._succeed)
+        self.execute = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        AppSettings.objects.update_or_create(pk=1, defaults={
+            'multi_tenant_enabled': True, 'initial_backfill_done': True,
+        })
+        self.server = TenantServer.objects.create(
+            name='Cloud', host='cloud', username='u', password_encrypted='x',
+        )
+
+    @staticmethod
+    def _succeed(run, workers=None):
+        UploadRun.objects.filter(pk=run.pk).update(status='success')
+        return run
+
+    def _tenant(self, name='Kilifi', database='openmrs_kilifi'):
+        return Facility.objects.create(
+            name=name, host='cloud', username='u', server=self.server,
+            database_name=database, mfl_code=name,
+        )
+
+    def test_the_nightly_run_refreshes_the_database_list_first(self):
+        self._tenant()
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all',
+                        return_value=[]) as sync:
+            call_command('upload_appointments')
+
+        # reprobe=False: a container that already answered is not going to
+        # change its MFL, and re-asking a hundred of them wastes the window.
+        sync.assert_called_once_with(workers=None, reprobe=False)
+        self.assertEqual(UploadRun.objects.get().mode, 'tenant')
+
+    def test_no_sync_uploads_what_is_already_known(self):
+        self._tenant()
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all') as sync:
+            call_command('upload_appointments', no_sync=True)
+
+        sync.assert_not_called()
+        self.assertEqual(UploadRun.objects.get().mode, 'tenant')
+
+    def test_an_unreachable_server_does_not_stop_the_upload(self):
+        self._tenant()
+        summary = {'ok': False, 'message': 'Could not list databases: refused'}
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all',
+                        return_value=[(self.server, summary)]):
+            call_command('upload_appointments')
+
+        self.assertEqual(UploadRun.objects.get().mode, 'tenant')
+
+    def test_a_tenant_mode_deployment_with_no_servers_refuses_to_run(self):
+        TenantServer.objects.all().delete()
+        with self.assertRaises(CommandError) as ctx:
+            call_command('upload_appointments')
+        self.assertIn('no active tenant servers', str(ctx.exception))
+
+    def test_a_tenant_mode_deployment_with_nothing_discovered_refuses_to_run(self):
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all',
+                        return_value=[]):
+            with self.assertRaises(CommandError) as ctx:
+                call_command('upload_appointments')
+        self.assertIn('no active tenant databases', str(ctx.exception))
+        self.assertFalse(UploadRun.objects.exists())
+
+    def test_a_single_facility_rerun_uses_the_mode_that_facility_belongs_to(self):
+        facility = self._tenant()
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all',
+                        return_value=[]):
+            call_command('upload_appointments', facility=facility.pk)
+
+        self.assertEqual(UploadRun.objects.get().mode, 'tenant')
