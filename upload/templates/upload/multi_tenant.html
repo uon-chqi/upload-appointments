@@ -27,10 +27,7 @@
                 Enable multi-tenant mode
             </label>
             <div class="help">
-                Controls the nightly cron job only. When enabled it re-reads each server's
-                database list and uploads every active database below. Turning this on turns
-                multi-facility mode off — the two describe different deployments. Manual
-                uploads on this page work either way.
+                This ensures that cron job pulls data from all the databases.
             </div>
         </form>
     </div>
@@ -40,11 +37,6 @@
             <h2>Tenant Servers ({{ servers|length }})</h2>
             <button type="button" class="btn btn-primary" id="add-server-btn">Add Server</button>
         </div>
-        <p style="color:#666; font-size:14px; margin-bottom:16px;">
-            One MySQL instance holding an OpenMRS database per facility. Enter the connection
-            once; every database whose name starts with the prefix is picked up automatically,
-            and each one is asked for its own facility name and MFL code.
-        </p>
         {% if servers %}
         <table>
             <thead>
@@ -182,12 +174,6 @@
                 {% endfor %}
             </tbody>
         </table>
-        <div class="help" style="margin-top:12px">
-            Databases are added and removed by syncing, not by hand. One that cannot be
-            identified — no MFL code, or an MFL another facility already claims — is disabled
-            automatically, because the DIFF platform files records by MFL alone. Enabling or
-            disabling one yourself sticks: later syncs leave your choice alone.
-        </div>
         {% else %}
             <div class="empty">
                 No databases discovered yet. Add a server above — saving it runs the first sync.
