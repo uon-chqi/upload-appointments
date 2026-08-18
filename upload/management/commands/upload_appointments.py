@@ -146,8 +146,9 @@ class Command(BaseCommand):
                 self._sync_tenants(options.get('workers'))
             if not Facility.objects.tenants().filter(is_active=True).exists():
                 raise CommandError(
-                    'Multi-tenant mode is enabled but no active tenant databases '
-                    'have been discovered.'
+                    'Multi-tenant mode is enabled but no tenant database is '
+                    'switched on. Discovered databases start disabled; enable '
+                    'the ones that should upload on the Multi-Tenant page.'
                 )
         elif mode == 'multi':
             if not Facility.objects.standalone().filter(is_active=True).exists():

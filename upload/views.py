@@ -72,7 +72,8 @@ def _start_run(request, mode, dates=None, facilities=None, retry_of=None,
             facilities = list(Facility.objects.for_mode(mode).filter(is_active=True))
         if not facilities:
             return JsonResponse({'error': (
-                'No active tenant databases have been discovered.'
+                'No tenant databases are enabled. Discovered databases start '
+                'switched off — enable the ones that should upload.'
                 if mode == 'tenant' else 'No active facilities are configured.'
             )}, status=400)
 
@@ -327,6 +328,13 @@ def _multi_tenant_context(server_form=None, editing_pk=None):
         'servers': TenantServer.objects.all(),
         'facilities': facilities,
         'active_count': sum(1 for f in facilities if f.is_active),
+        # Discovered, never switched on by anybody. Worth its own count: at a
+        # hundred schemas the operator needs to see that some are waiting on
+        # them without reading down the table.
+        'awaiting_count': sum(
+            1 for f in facilities
+            if not f.is_active and f.activated_at is None and not f.disabled_by_sync
+        ),
         'runs': UploadRun.objects.filter(mode='tenant')[:50],
         'settings_obj': AppSettings.load(),
         'active_run': services.active_run(),
@@ -450,12 +458,19 @@ def tenant_toggle(request, pk):
     """Include or exclude one discovered database in uploads.
 
     Clears `disabled_by_sync` either way: once an operator has made the call by
-    hand, a later sync must not overturn it.
+    hand, a later sync must not overturn it. Enabling also stamps
+    `activated_at`, which is what tells a discovered database nobody has chosen
+    yet from one that was chosen and later auto-disabled — only the second is
+    ever switched back on by a sync.
     """
     facility = get_object_or_404(Facility, pk=pk, server__isnull=False)
     facility.is_active = not facility.is_active
     facility.disabled_by_sync = False
-    facility.save(update_fields=['is_active', 'disabled_by_sync', 'updated_at'])
+    fields = ['is_active', 'disabled_by_sync', 'updated_at']
+    if facility.is_active and facility.activated_at is None:
+        facility.activated_at = timezone.now()
+        fields.append('activated_at')
+    facility.save(update_fields=fields)
     return redirect('upload:multi_tenant')
 
 

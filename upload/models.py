@@ -202,6 +202,11 @@ class Facility(models.Model):
     # because it could not be identified. Distinguishes that from an operator
     # switching it off, which a later sync must not quietly undo.
     disabled_by_sync = models.BooleanField(default=False)
+    # When an operator first switched this facility on. A discovered tenant is
+    # created switched off — sync finds schemas, a person decides which of them
+    # upload — so this is what separates "not chosen yet" from "chosen, and
+    # sync had to disable it since". Only the second may sync switch back on.
+    activated_at = models.DateTimeField(null=True, blank=True)
     # Last time a sync saw this schema on its server. NULL for standalone rows.
     last_seen_at = models.DateTimeField(null=True, blank=True)
     # When this facility's pending appointments were last fully loaded. Per

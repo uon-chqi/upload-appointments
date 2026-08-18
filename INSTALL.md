@@ -177,11 +177,18 @@ On the **Server Setup** tab, click **Add Server**:
 Click **Test Connection** to check the prefix is selecting the databases you
 expect before saving. Saving runs the first sync straight away.
 
-### 2. Check the discovered databases
+### 2. Enable the databases you want to upload
 
 Every matching database appears in the **Discovered Databases** table, with the
 facility name and MFL code read from inside it — the same values an upload would
 send. You never type these in.
+
+**Newly discovered databases start switched off**, shown as **Not enabled**. A
+server usually holds more than the facilities you are here to upload — demos,
+archives, a test copy — so sync only reports what is there, and you decide what
+uploads. Press **Enable** on each database that should be included; nothing else
+is ever uploaded, by cron or by hand. A database you have never enabled stays off
+no matter how many times the server is synced.
 
 A database is disabled automatically, and shown as **Not identified**, when:
 
@@ -189,13 +196,13 @@ A database is disabled automatically, and shown as **Not identified**, when:
 - its MFL code is already claimed by another facility, which would make the two
   overwrite each other's data upstream.
 
-Fix these in KenyaEMR, then press **Sync** on the server to pick up the change.
-You can also enable or disable a database yourself; that choice sticks, and later
-syncs will not undo it.
+Fix these in KenyaEMR, then press **Enable** on the database once a sync shows
+it identified. Disabling a database you enabled also sticks: later syncs will not
+switch it back on by themselves.
 
 Press **Sync** whenever databases are added to or removed from the server. A
 database that disappears is disabled rather than deleted, so its upload history
-is kept and it comes back automatically if the database returns.
+is kept, and one you had enabled comes back on automatically if it returns.
 
 ### 3. Turn on multi-tenant mode
 

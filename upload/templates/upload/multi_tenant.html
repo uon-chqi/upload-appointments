@@ -109,6 +109,13 @@
         <div class="card-header">
             <h2>Discovered Databases ({{ active_count }} active of {{ facilities|length }})</h2>
         </div>
+        {% if awaiting_count %}
+            <div class="help" style="margin-bottom:12px">
+                {{ awaiting_count }} newly discovered database{{ awaiting_count|pluralize }}
+                {{ awaiting_count|pluralize:"is,are" }} switched off. Sync finds every
+                schema on the server; enable the ones that should upload.
+            </div>
+        {% endif %}
         {% if facilities %}
         <table>
             <thead>
@@ -157,8 +164,12 @@
                         {% elif facility.disabled_by_sync %}
                             <span class="badge badge-failed"
                                   title="{{ facility.last_test_message }}">Auto-disabled</span>
-                        {% else %}
+                        {% elif facility.activated_at %}
                             <span class="badge badge-muted">No</span>
+                        {% else %}
+                            <span class="badge badge-pending"
+                                  title="Discovered but never enabled. It uploads once you
+                                         switch it on.">Not enabled</span>
                         {% endif %}
                     </td>
                     <td style="white-space:nowrap">

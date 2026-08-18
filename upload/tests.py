@@ -1120,6 +1120,12 @@ class TenantSyncTests(TestCase):
                 ):
             return tenants.sync_server(self.server, **kwargs)
 
+    def enable(self, database='openmrs_kilifi'):
+        """Stand in for an operator switching a discovered database on."""
+        Facility.objects.filter(database_name=database).update(
+            is_active=True, disabled_by_sync=False, activated_at=timezone.now(),
+        )
+
     def test_schemas_become_facilities_named_by_what_they_report(self):
         summary = self.sync(
             ['openmrs_kilifi', 'openmrs_malindi'],
@@ -1135,8 +1141,52 @@ class TenantSyncTests(TestCase):
         self.assertEqual(kilifi.name, 'Kilifi Dispensary')
         self.assertEqual(kilifi.mfl_code, '12345')
         self.assertEqual(kilifi.server, self.server)
-        self.assertTrue(kilifi.is_active)
         self.assertIsNotNone(kilifi.last_seen_at)
+
+    def test_a_newly_discovered_schema_is_listed_but_left_switched_off(self):
+        # A server may hold schemas that are demos, archives, or simply not this
+        # deployment's to upload. Sync says what is there; an operator says what
+        # uploads.
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+
+        facility = Facility.objects.get(database_name='openmrs_kilifi')
+        self.assertFalse(facility.is_active)
+        self.assertIsNone(facility.activated_at)
+        # Nothing is wrong with it — it identified cleanly — so it must not read
+        # as auto-disabled either.
+        self.assertFalse(facility.disabled_by_sync)
+        self.assertEqual(facility.mfl_code, '12345')
+        self.assertTrue(facility.last_test_ok)
+
+    def test_a_schema_nobody_enabled_is_never_switched_on_by_a_later_sync(self):
+        self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result(message='down')})
+        self.assertTrue(
+            Facility.objects.get(database_name='openmrs_kilifi').disabled_by_sync,
+        )
+
+        # Recovering clears the problem, but the choice was never made.
+        summary = self.sync(
+            ['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')},
+        )
+
+        self.assertEqual(summary['reappeared'], 0)
+        self.assertFalse(Facility.objects.get(database_name='openmrs_kilifi').is_active)
+
+    def test_enabling_one_database_leaves_the_rest_switched_off(self):
+        probes = {
+            'openmrs_kilifi': probe_result('12345', 'Kilifi'),
+            'openmrs_malindi': probe_result('67890', 'Malindi'),
+        }
+        self.sync(['openmrs_kilifi', 'openmrs_malindi'], probes)
+        self.enable('openmrs_kilifi')
+
+        self.sync(['openmrs_kilifi', 'openmrs_malindi'], probes)
+
+        self.assertEqual(
+            list(Facility.objects.tenants().filter(is_active=True)
+                 .values_list('database_name', flat=True)),
+            ['openmrs_kilifi'],
+        )
 
     def test_a_tenant_connects_through_its_server_not_its_own_row(self):
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
@@ -1185,6 +1235,7 @@ class TenantSyncTests(TestCase):
 
     def test_a_recovered_facility_follows_a_rename_upstream(self):
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        self.enable()
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result(message='down')})
 
         self.sync(
@@ -1218,7 +1269,11 @@ class TenantSyncTests(TestCase):
 
         self.assertEqual(summary['unidentified'], 1)
         self.assertEqual(Facility.objects.filter(mfl_code='12345').count(), 1)
-        self.assertEqual(Facility.objects.tenants().filter(is_active=True).count(), 1)
+        # Both start switched off; only the one holding the MFL is enableable,
+        # and the other carries the reason it is not.
+        loser = Facility.objects.get(mfl_code='')
+        self.assertTrue(loser.disabled_by_sync)
+        self.assertIn('already used by', loser.last_test_message)
 
     def test_a_schema_that_disappears_is_deactivated_not_deleted(self):
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
@@ -1233,6 +1288,7 @@ class TenantSyncTests(TestCase):
 
     def test_a_schema_that_comes_back_is_re_enabled(self):
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        self.enable()
         self.sync([])
 
         summary = self.sync(
@@ -1259,6 +1315,7 @@ class TenantSyncTests(TestCase):
 
     def test_a_facility_switched_off_by_hand_stays_off(self):
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        self.enable()
         Facility.objects.update(is_active=False, disabled_by_sync=False)
 
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
@@ -1300,6 +1357,7 @@ class TenantSyncTests(TestCase):
 
     def test_an_unreachable_server_changes_nothing_and_says_so(self):
         self.sync(['openmrs_kilifi'], {'openmrs_kilifi': probe_result('12345', 'Kilifi')})
+        self.enable()
 
         with mock.patch.object(openmrs, 'list_databases',
                                side_effect=OSError('connection refused')):
@@ -1521,6 +1579,35 @@ class MultiTenantViewTests(TestCase):
         self.assertTrue(facility.is_active)
         self.assertFalse(facility.disabled_by_sync)
 
+    def test_enabling_a_database_records_that_somebody_chose_it(self):
+        facility = self._tenant(self._server())
+        Facility.objects.filter(pk=facility.pk).update(is_active=False)
+        url = reverse('upload:tenant_toggle', kwargs={'pk': facility.pk})
+
+        self.client.post(url)
+
+        facility.refresh_from_db()
+        chosen_at = facility.activated_at
+        self.assertIsNotNone(chosen_at)
+
+        # Switching it off again does not un-choose it: sync may put back what
+        # sync took away, and only this stamp tells it that it may.
+        self.client.post(url)
+        facility.refresh_from_db()
+        self.assertFalse(facility.is_active)
+        self.assertEqual(facility.activated_at, chosen_at)
+
+    def test_the_page_says_how_many_databases_are_waiting_to_be_enabled(self):
+        server = self._server()
+        self._tenant(server, 'openmrs_kilifi', 'Kilifi', '1')
+        self._tenant(server, 'openmrs_malindi', 'Malindi', '2')
+        Facility.objects.filter(database_name='openmrs_malindi').update(is_active=False)
+
+        response = self.client.get(reverse('upload:multi_tenant'))
+
+        self.assertEqual(response.context['awaiting_count'], 1)
+        self.assertContains(response, 'Not enabled')
+
     def test_the_facility_form_cannot_reach_a_discovered_database(self):
         facility = self._tenant(self._server())
 
@@ -1564,7 +1651,7 @@ class MultiTenantViewTests(TestCase):
                                     {'date_from': '2026-01-01', 'date_to': '2026-01-02'})
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn('No active tenant databases', response.json()['error'])
+        self.assertIn('No tenant databases are enabled', response.json()['error'])
         mock_spawn.assert_not_called()
 
     @mock.patch('upload.services.spawn_run')
@@ -1677,7 +1764,7 @@ class UploadCommandTenantTests(TestCase):
                         return_value=[]):
             with self.assertRaises(CommandError) as ctx:
                 call_command('upload_appointments')
-        self.assertIn('no active tenant databases', str(ctx.exception))
+        self.assertIn('no tenant database is switched on', str(ctx.exception))
         self.assertFalse(UploadRun.objects.exists())
 
     def test_a_single_facility_rerun_uses_the_mode_that_facility_belongs_to(self):

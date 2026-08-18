@@ -34,11 +34,12 @@ class FacilityAdmin(admin.ModelAdmin):
     search_fields = ['name', 'host', 'mfl_code', 'database_name']
     # password_encrypted is deliberately absent: nothing should render it.
     fields = ['name', 'server', 'host', 'port', 'database_name', 'username', 'is_active',
-              'mfl_code', 'mfl_facility_name', 'disabled_by_sync', 'last_seen_at',
+              'mfl_code', 'mfl_facility_name', 'disabled_by_sync', 'activated_at',
+              'last_seen_at',
               'last_tested_at', 'last_test_ok', 'last_test_message']
     # Discovered rows are sync's to write; editing them here would be undone.
     readonly_fields = ['server', 'mfl_code', 'mfl_facility_name', 'disabled_by_sync',
-                       'last_seen_at', 'last_tested_at', 'last_test_ok',
+                       'activated_at', 'last_seen_at', 'last_tested_at', 'last_test_ok',
                        'last_test_message']
 
 

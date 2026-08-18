@@ -12,6 +12,10 @@ and the server itself knows the list. Syncing therefore does three things:
 3. reconciles the answers into `Facility` rows, which is all the upload pipeline
    ever looks at — runs, retries and backfill stamps then work unchanged.
 
+A newly discovered schema is created disabled: sync says what is there, an
+operator says what uploads. Nothing an operator has not switched on is ever
+switched on by a later sync.
+
 Only step 2 is parallel, and it touches MySQL alone: every ORM write happens on
 the calling thread afterwards, so there are no worker DB connections to clean up
 and a half-finished probe can never leave a facility half-written.
@@ -201,6 +205,13 @@ def sync_server(server, workers=None, reprobe=True):
         if is_new:
             facility = Facility(server=server, database_name=database)
             facility.password_encrypted = ''  # Credentials belong to the server.
+            # Discovered is not the same as wanted. A server may hold schemas
+            # that are demos, archives, or simply not this deployment's to
+            # upload, and at a hundred of them an operator cannot be expected to
+            # notice one that switched itself on. So a new schema is listed and
+            # left off; `activated_at` stays NULL until somebody enables it.
+            facility.is_active = False
+            facility.disabled_by_sync = False
         else:
             taken_names.discard(facility.name)
 
@@ -248,11 +259,13 @@ def sync_server(server, workers=None, reprobe=True):
                 facility.mfl_facility_name = result['facility_name']
                 facility.last_test_ok = True
                 facility.last_test_message = result['message']
-                if is_new or was_disabled_by_sync:
+                # Sync only ever switches back on what an operator switched
+                # on before and sync itself took away. One that was never
+                # enabled stays off however cleanly it now identifies.
+                if was_disabled_by_sync and facility.activated_at:
                     facility.is_active = True
                     facility.disabled_by_sync = False
-                    if not is_new:
-                        summary['reappeared'] += 1
+                    summary['reappeared'] += 1
 
         # Name a row when it is new, or when a successful probe has a better name
         # than the one sync itself last derived. A failed probe never renames:
@@ -283,8 +296,8 @@ def sync_server(server, workers=None, reprobe=True):
 
     summary['ok'] = True
     summary['message'] = (
-        '{} database(s) found — {} added, {} updated, {} gone, '
-        '{} could not be identified.'.format(
+        '{} database(s) found — {} added (disabled until enabled), {} updated, '
+        '{} gone, {} could not be identified.'.format(
             summary['databases'], summary['added'], summary['updated'],
             summary['disappeared'], summary['unidentified'],
         )
