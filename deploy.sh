@@ -47,10 +47,68 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# mysqlclient compiles against a MySQL/MariaDB client library and locates it with
+# pkg-config. Which package provides that varies by box: Ubuntu's own
+# default-libmysqlclient-dev, MariaDB's libmariadb-dev, or an Oracle MySQL apt-repo
+# libmysqlclient-dev — and some of those ship no .pc file at all. Rather than trust
+# one package name, check what pkg-config can actually see.
+mysql_dev_present() {
+    pkg-config --exists mysqlclient 2>/dev/null && return 0
+    pkg-config --exists mariadb 2>/dev/null && return 0
+    pkg-config --exists libmariadb 2>/dev/null && return 0
+    return 1
+}
+
+# Make the build work even when no package satisfied pkg-config: point it at a .pc
+# file installed outside its search path, or, failing that, take the compiler flags
+# straight from mysql_config/mariadb_config, which mysqlclient honours via
+# MYSQLCLIENT_CFLAGS/MYSQLCLIENT_LDFLAGS.
+ensure_mysql_build_flags() {
+    if mysql_dev_present; then
+        return 0
+    fi
+
+    local pc
+    pc=$(find /usr -maxdepth 6 \( -name 'mysqlclient.pc' -o -name 'mariadb.pc' -o -name 'libmariadb.pc' \) 2>/dev/null | head -n1) || true
+    if [[ -n "$pc" ]]; then
+        export PKG_CONFIG_PATH="$(dirname "$pc")${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        if mysql_dev_present; then
+            echo "  Using MySQL client pkg-config from $(dirname "$pc")"
+            return 0
+        fi
+        # The file is there but unresolvable — an unsatisfied Requires, usually.
+        # mysql_config below reports the same flags without consulting pkg-config.
+    fi
+
+    local cfg
+    for cfg in mysql_config mariadb_config; do
+        if command -v "$cfg" > /dev/null 2>&1; then
+            MYSQLCLIENT_CFLAGS="$($cfg --cflags 2>/dev/null)" || continue
+            MYSQLCLIENT_LDFLAGS="$($cfg --libs 2>/dev/null)" || continue
+            export MYSQLCLIENT_CFLAGS MYSQLCLIENT_LDFLAGS
+            echo "  Using MySQL client build flags from $cfg."
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # --- Install system dependencies ---
 echo "[1/9] Installing system dependencies..."
 apt-get update -qq --allow-releaseinfo-change 2>/dev/null || true
-apt-get install -y -qq python3 python3-venv python3-dev gcc pkg-config libmysqlclient-dev git gnupg > /dev/null
+# libssl-dev/zlib1g-dev are here for pkg-config, not for the compiler: the MySQL
+# apt-repo build of mysqlclient.pc declares Requires on openssl, and pkg-config
+# reports the whole package missing when a dependency's .pc file is absent.
+apt-get install -y -qq python3 python3-venv python3-dev gcc pkg-config libssl-dev zlib1g-dev git gnupg > /dev/null
+
+if ! mysql_dev_present; then
+    for pkg in default-libmysqlclient-dev libmysqlclient-dev libmariadb-dev libmariadbclient-dev; do
+        apt-get install -y -qq "$pkg" > /dev/null 2>&1 || continue
+        echo "  Installed MySQL client headers from $pkg."
+        mysql_dev_present && break
+    done
+fi
 echo "  Done."
 
 # --- Clone or pull the repo ---
@@ -69,6 +127,12 @@ echo "  Done."
 
 # --- Create virtual environment and install dependencies ---
 echo "[3/9] Setting up Python virtual environment..."
+if ! ensure_mysql_build_flags; then
+    echo "  Error: no MySQL/MariaDB client development library found."
+    echo "         mysqlclient cannot be built without one. Install it and re-run:"
+    echo "           sudo apt-get install -y default-libmysqlclient-dev pkg-config"
+    exit 1
+fi
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip -q
 "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" -q

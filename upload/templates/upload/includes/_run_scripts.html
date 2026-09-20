@@ -109,7 +109,8 @@ window.runPanel = (function() {
                 clearInterval(interval);
                 if (data.status === 'success') {
                     bar.style.background = '#28a745';
-                    finish('Upload complete — ' + data.records_uploaded + ' records across ' +
+                    finish('Upload complete — ' + data.records_uploaded + ' records and ' +
+                           data.patient_updates_uploaded + ' patient updates across ' +
                            data.facilities_total + ' ' + unitPlural + '.', 'status-success');
                 } else if (data.status === 'partial') {
                     bar.style.background = '#f0ad4e';
@@ -140,6 +141,7 @@ window.runPanel = (function() {
         document.getElementById('count-failed').textContent = failed;
         document.getElementById('count-pending').textContent = total - done - failed;
         document.getElementById('count-records').textContent = data.records_uploaded;
+        document.getElementById('count-updates').textContent = data.patient_updates_uploaded;
 
         if (data.status === 'in_progress') {
             status.textContent = 'Uploading ' + data.facilities_completed + ' of ' +
@@ -156,6 +158,7 @@ window.runPanel = (function() {
             '<span class="mini-bar"><span style="width:' + pct + '%"></span></span>' +
             '<span class="badge badge-' + f.status + '">' + f.status.replace('_', ' ') + '</span>' +
             '<span class="muted">' + f.records_uploaded + ' rec</span>' +
+            '<span class="muted">' + f.patient_updates_uploaded + ' upd</span>' +
             (f.error_message ? '<span class="error-text" title="' + escapeHtml(f.error_message) + '">error</span>' : '') +
             '</div>';
     }

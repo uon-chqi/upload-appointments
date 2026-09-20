@@ -33,6 +33,7 @@ def _serialize_run(run):
         'facilities_completed': run.facilities_completed,
         'facilities_failed': run.facilities_failed,
         'records_uploaded': run.records_uploaded,
+        'patient_updates_uploaded': run.patient_updates_uploaded,
         'message': run.message,
         'facilities': [
             {
@@ -40,6 +41,7 @@ def _serialize_run(run):
                 'label': log.facility_label,
                 'status': log.status,
                 'records_uploaded': log.records_uploaded,
+                'patient_updates_uploaded': log.patient_updates_uploaded,
                 'batches_total': log.batches_total,
                 'batches_completed': log.batches_completed,
                 'error_message': log.error_message[:ERROR_PREVIEW_CHARS] if log.error_message else '',

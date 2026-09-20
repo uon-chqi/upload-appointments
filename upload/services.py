@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import random
 import subprocess
@@ -203,32 +204,37 @@ def _post_batch_with_retry(url, payload, tokens, batch_num, total_batches,
         time.sleep(delay)
 
 
-def upload_patients(patients, tokens, log=None, batch_size=None, max_retries=4,
-                    progress_interval=3.0):
-    """POST patient data to the Ushauri DIFF platform in batches.
+def _upload_records(url, records, tokens, log=None, batch_size=None, max_retries=4,
+                    progress_interval=3.0, batch_offset=0, batches_total=None):
+    """POST records to `url` in batches of `batch_size`.
 
     Progress is written to `log` at most once every `progress_interval` seconds
-    (and always on the final batch). Saving after every batch of ten would have a
-    hundred facilities hammering one SQLite file for the whole run.
+    (and always on this phase's final batch). Saving after every batch of ten
+    would have a hundred facilities hammering one SQLite file for the whole run.
+
+    `batch_offset` and `batches_total` let the two phases of one facility —
+    appointments, then patient updates — share a single progress bar: the second
+    phase carries on from the first's batch number instead of restarting at
+    zero, so the bar never jumps backwards mid-facility.
     """
-    import math
     batch_size = batch_size or settings.UPLOAD_BATCH_SIZE
-    url = f"{settings.CHQI_API_BASE_URL}/api/patients/upload-json"
-    total_batches = math.ceil(len(patients) / batch_size)
+    own_batches = math.ceil(len(records) / batch_size)
+    last_batch = batch_offset + own_batches
+    total_batches = own_batches if batches_total is None else batches_total
     if log:
         log.batches_total = total_batches
-        log.batches_completed = 0
+        log.batches_completed = batch_offset
         log.save(update_fields=['batches_total', 'batches_completed'])
 
     results = []
     # Seed from the clock, not zero: monotonic() is time-since-boot, so a zero
     # seed would make the first batch always look overdue for a save.
     last_saved = time.monotonic()
-    for i in range(0, len(patients), batch_size):
-        batch = patients[i:i + batch_size]
-        batch_num = i // batch_size + 1
-        logger.info("Uploading batch %d/%d (%d–%d of %d patients)",
-                     batch_num, total_batches, i + 1, i + len(batch), len(patients))
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        batch_num = batch_offset + i // batch_size + 1
+        logger.info("Uploading batch %d/%d (%d–%d of %d records) to %s",
+                    batch_num, total_batches, i + 1, i + len(batch), len(records), url)
         response = _post_batch_with_retry(
             url,
             json.dumps({'patients': batch}),
@@ -241,15 +247,42 @@ def upload_patients(patients, tokens, log=None, batch_size=None, max_retries=4,
 
         if log:
             now = time.monotonic()
-            if batch_num == total_batches or now - last_saved >= progress_interval:
+            if batch_num == last_batch or now - last_saved >= progress_interval:
                 log.batches_completed = batch_num
                 log.save(update_fields=['batches_completed'])
                 last_saved = now
     return results
 
 
+def upload_patients(patients, tokens, log=None, **kwargs):
+    """Send appointment records to the DIFF platform."""
+    url = f"{settings.CHQI_API_BASE_URL}/api/patients/upload-json"
+    return _upload_records(url, patients, tokens, log=log, **kwargs)
+
+
+def upload_patient_updates(patients, tokens, log=None, **kwargs):
+    """Send the between-visit patient details to the DIFF platform.
+
+    A separate endpoint, and a separate table upstream: these rows carry only
+    what can have changed since the appointment was uploaded, and are appended
+    rather than overwriting, so a patient's risk and lab history is kept.
+    """
+    url = f"{settings.CHQI_API_BASE_URL}/api/patients/update-json"
+    return _upload_records(url, patients, tokens, log=log, **kwargs)
+
+
 def upload_facility(log, config, tokens, backfill=False):
-    """Query one facility and upload its appointments, recording the outcome on `log`.
+    """Query one facility and upload it, recording the outcome on `log`.
+
+    Two uploads per facility, in order: the appointments for the period, then the
+    patient details that can have changed since those appointments were first
+    sent. The second is not bounded by the period and happens on every run — an
+    appointment uploaded last month is still what the platform is working from,
+    and its phone number, risk score and labs are what go stale.
+
+    Either failing fails the facility, which is what the "Retry failed" button
+    re-runs. Upstream appends rather than overwrites, so a retry after a
+    half-finished upload duplicates rather than corrupts.
 
     `backfill` drops the date window and sends every pending appointment — the
     one-off initial load. On success it stamps the facility, so a run that leaves
@@ -262,18 +295,35 @@ def upload_facility(log, config, tokens, backfill=False):
 
     period = 'all pending' if backfill else '{} to {}'.format(log.date_from, log.date_to)
     try:
+        # Both queries run on one connection: opening a second one per facility
+        # would double the connection count a hundred containers present at once.
         with openmrs.connect(config) as conn:
             if backfill:
                 patients = openmrs.fetch_appointments(conn)
             else:
                 patients = openmrs.fetch_appointments(conn, log.date_from, log.date_to)
+            # Unaffected by the date window or by `backfill`: the patient-detail
+            # refresh always covers everybody with a pending appointment.
+            updates = openmrs.fetch_patient_updates(conn)
 
         log.records_uploaded = len(patients)
-        log.save(update_fields=['records_uploaded'])
+        log.patient_updates_uploaded = len(updates)
+        log.save(update_fields=['records_uploaded', 'patient_updates_uploaded'])
+
+        # The two phases share one progress bar, so the batch count is worked out
+        # across both before either starts.
+        batch_size = settings.UPLOAD_BATCH_SIZE
+        appointment_batches = math.ceil(len(patients) / batch_size)
+        total_batches = appointment_batches + math.ceil(len(updates) / batch_size)
 
         if patients:
-            upload_patients(patients, tokens, log=log)
-        else:
+            upload_patients(patients, tokens, log=log, batches_total=total_batches)
+        if updates:
+            upload_patient_updates(
+                updates, tokens, log=log,
+                batch_offset=appointment_batches, batches_total=total_batches,
+            )
+        if not patients and not updates:
             log.error_message = 'No records found for the given period.'
 
         log.status = 'success'
@@ -281,8 +331,8 @@ def upload_facility(log, config, tokens, backfill=False):
             Facility.objects.filter(pk=log.facility_id).update(
                 initial_backfill_at=timezone.now(),
             )
-        logger.info("Upload successful for %s: %d records for %s",
-                    config.label, len(patients), period)
+        logger.info("Upload successful for %s: %d records for %s, %d patient update(s)",
+                    config.label, len(patients), period, len(updates))
     except Exception:
         log.error_message = traceback.format_exc()
         log.status = 'failed'
@@ -414,15 +464,19 @@ def _finalize_run(run):
     else:
         status = 'partial'
 
-    totals = run.logs.aggregate(total=Sum('records_uploaded'))
+    totals = run.logs.aggregate(
+        total=Sum('records_uploaded'),
+        updates=Sum('patient_updates_uploaded'),
+    )
     run.status = status
     run.facilities_completed = len(statuses)
     run.facilities_failed = failed
     run.records_uploaded = totals['total'] or 0
+    run.patient_updates_uploaded = totals['updates'] or 0
     run.finished_at = timezone.now()
     run.save(update_fields=[
         'status', 'facilities_completed', 'facilities_failed',
-        'records_uploaded', 'finished_at',
+        'records_uploaded', 'patient_updates_uploaded', 'finished_at',
     ])
     if run.is_backfill and status in ('success', 'partial'):
         _record_backfill_done(run)

@@ -318,6 +318,11 @@ class UploadRun(models.Model):
     facilities_completed = models.IntegerField(default=0)
     facilities_failed = models.IntegerField(default=0)
     records_uploaded = models.IntegerField(default=0)
+    # Patient-detail rows sent to the update endpoint. Counted apart from
+    # records_uploaded because they are a different kind of thing — one per
+    # patient with a pending appointment, re-sent every run — and summing the
+    # two would make a night's appointment intake look far larger than it was.
+    patient_updates_uploaded = models.IntegerField(default=0)
     message = models.TextField(blank=True, default='')
 
     retry_of = models.ForeignKey(
@@ -382,6 +387,9 @@ class UploadLog(models.Model):
     )
     status = models.CharField(max_length=15, choices=STATUS_CHOICES)
     records_uploaded = models.IntegerField(default=0)
+    patient_updates_uploaded = models.IntegerField(default=0)
+    # Both phases of the facility — appointments then patient updates — count
+    # into one batch total, so the progress bar runs 0-100% once per facility.
     batches_total = models.IntegerField(default=0)
     batches_completed = models.IntegerField(default=0)
     error_message = models.TextField(blank=True, default='')

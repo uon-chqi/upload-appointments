@@ -46,7 +46,11 @@ READ_TIMEOUT = 900
 # _APPOINTMENT_QUERY_BODY stops just short of the date predicate so the two
 # variants below can share it — concatenated rather than formatted, because
 # str.format would choke the moment someone adds a brace to the SQL.
-_APPOINTMENT_QUERY_BODY = """
+#
+# _COMMON_CTES is shared further still: the patient-details update reads a
+# narrower set of columns from exactly the same pending appointments, so one copy
+# of the CTEs is what keeps the two from drifting apart.
+_COMMON_CTES = """
 with pending_appointments as (select x.patient_id, x.start_date_time, x.status, y.name as appointment_type, x.date_appointment_scheduled
 from patient_appointment x
 inner join appointment_service y on x.appointment_service_id = y.appointment_service_id
@@ -108,7 +112,9 @@ LEFT JOIN concept_name cn1
     AND cn1.locale = 'en'
     AND cn1.concept_name_type = 'FULLY_SPECIFIED'
 WHERE e.voided = 0 AND cn1.name LIKE '%%cd4%%')
-select * from
+"""
+
+_APPOINTMENT_QUERY_BODY = _COMMON_CTES + """select * from
 (
 select distinct a.patient_id
 , (select date_started from visit x where x.patient_id = a.patient_id order by date_started desc limit 1) as visit_date
@@ -173,6 +179,35 @@ APPOINTMENT_QUERY = (
 # non-cancelled appointments in the future, so it is "everything outstanding",
 # not "everything ever".
 APPOINTMENT_BACKFILL_QUERY = _APPOINTMENT_QUERY_BODY
+
+# Patient details that can change between visits — phone number, risk score and
+# latest labs — for every patient with a pending appointment. Sent on every run
+# regardless of the date window: the point is the *current* value of fields the
+# appointment rows already uploaded will have gone stale on, not a night's worth
+# of new bookings, so there is no dated variant of this one.
+PATIENT_UPDATE_QUERY = _COMMON_CTES + """select * from
+(
+select distinct a.patient_id
+, (select x.identifier from patient_identifier x inner join patient_identifier_type y on x.identifier_type=y.patient_identifier_type_id
+and y.name ='Unique Patient Number' where x.patient_id = a.patient_id limit 1) as ccc_number
+, (select x.value from person_attribute x inner join person_attribute_type y on x.person_attribute_type_id =y.person_attribute_type_id
+and y.name='Telephone contact' where x.person_id = a.patient_id limit 1) as phone_number
+, (select x.facility_mfl from facility x limit 1) as facility_mfl
+, (select x.facility_name from facility x limit 1) as facility_name
+, (select case when x.value_coded=1065 then 'Yes' else 'No' end as response from obs x where x.concept_id=166607 and x.person_id=a.patient_id order by obs_datetime desc limit 1) as consented
+, (select risk_score from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_classification_value
+, (select description from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_classification
+, (select risk_factors from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_factors
+, (select evaluation_date from kenyaemr_ml_patient_risk_score x where x.patient_id = a.patient_id and x.description <> 'Unknown Risk' order by x.evaluation_date desc limit 1) as risk_classification_date
+, (select TestResults from vls x where x.patient_id=a.patient_id order by VLDate desc limit 1) as last_viral_load
+, (select VLDate from vls x where x.patient_id=a.patient_id order by VLDate desc limit 1) as last_viral_load_date
+, (select TestResults from cd4 x where x.patient_id=a.patient_id order by TestDate desc limit 1) as last_cd4
+, (select TestDate from cd4 x where x.patient_id=a.patient_id order by TestDate desc limit 1) as last_cd4_date
+from pending_appointments a
+inner join person b on a.patient_id = b.person_id
+left join person_address d on a.patient_id = d.person_id
+) data where data.consented='Yes'
+"""
 
 # A KenyaEMR container carries the whole national facility list in `location`
 # (~13,700 rows), so the container's own identity has to come from the
@@ -368,6 +403,47 @@ def fetch_appointments(conn, date_from=None, date_to=None):
             'cormobidities': _safe_str(record.get('cormobidities')),
             'start_ART_date': _safe_str(record.get('start_ART_date')),
             'restart_ART_date': _safe_str(record.get('restart_ART_date')),
+        })
+    return patients
+
+
+def fetch_patient_updates(conn):
+    """Query one facility for the patient details that go stale between visits.
+
+    One row per patient with a pending appointment — not one per appointment, as
+    `fetch_appointments` gives — carrying only the fields the DIFF platform needs
+    refreshed: contact number, risk classification and latest labs, plus
+    `patient_id`/`ccc_number` to match the row back to an appointment upstream.
+
+    Unfiltered by date on purpose: the upstream endpoint appends every batch, so
+    what it wants each night is the current value for everybody outstanding, not
+    the subset booked in the window.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute(PATIENT_UPDATE_QUERY)
+        columns = [col[0] for col in cursor.description]
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+
+    patients = []
+    for row in rows:
+        record = dict(zip(columns, row))
+        patients.append({
+            'patient_id': _safe_str(record.get('patient_id')),
+            'ccc_number': _safe_str(record.get('ccc_number')),
+            'facility_mfl': _safe_str(record.get('facility_mfl')),
+            'facility_name': _safe_str(record.get('facility_name')),
+            'phone_number': _safe_str(record.get('phone_number')),
+            'risk_classification': _safe_str(record.get('risk_classification'), 'Unknown'),
+            'risk_classification_value': _safe_float(record.get('risk_classification_value')),
+            'risk_classification_date': _safe_str(record.get('risk_classification_date')),
+            'risk_factors': _safe_str(record.get('risk_factors')),
+            'last_viral_load': _safe_str(record.get('last_viral_load')),
+            'last_viral_load_date': _safe_str(record.get('last_viral_load_date')),
+            'last_cd4': _safe_str(record.get('last_cd4')),
+            'last_cd4_date': _safe_str(record.get('last_cd4_date')),
         })
     return patients
 

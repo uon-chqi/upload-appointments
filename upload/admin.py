@@ -46,8 +46,9 @@ class FacilityAdmin(admin.ModelAdmin):
 class UploadLogInline(admin.TabularInline):
     model = UploadLog
     extra = 0
-    fields = ['facility_label', 'status', 'records_uploaded', 'batches_completed',
-              'batches_total', 'finished_at']
+    fields = ['facility_label', 'status', 'records_uploaded',
+              'patient_updates_uploaded', 'batches_completed', 'batches_total',
+              'finished_at']
     readonly_fields = fields
     can_delete = False
 
@@ -56,7 +57,7 @@ class UploadLogInline(admin.TabularInline):
 class UploadRunAdmin(admin.ModelAdmin):
     list_display = ['date_from', 'date_to', 'mode', 'triggered_by', 'status',
                     'facilities_completed', 'facilities_total', 'facilities_failed',
-                    'records_uploaded', 'created_at']
+                    'records_uploaded', 'patient_updates_uploaded', 'created_at']
     list_filter = ['status', 'mode', 'triggered_by', 'created_at']
     inlines = [UploadLogInline]
 
@@ -64,10 +65,12 @@ class UploadRunAdmin(admin.ModelAdmin):
 @admin.register(UploadLog)
 class UploadLogAdmin(admin.ModelAdmin):
     list_display = ['date_from', 'date_to', 'facility_label', 'triggered_by',
-                    'triggered_by_user', 'status', 'records_uploaded', 'created_at']
+                    'triggered_by_user', 'status', 'records_uploaded',
+                    'patient_updates_uploaded', 'created_at']
     list_filter = ['status', 'triggered_by', 'created_at']
     search_fields = ['error_message', 'facility_label']
     readonly_fields = ['run', 'facility', 'facility_label', 'date_from', 'date_to',
                        'triggered_by', 'triggered_by_user', 'status', 'records_uploaded',
-                       'batches_total', 'batches_completed', 'error_message',
+                       'patient_updates_uploaded', 'batches_total', 'batches_completed',
+                       'error_message',
                        'started_at', 'finished_at', 'created_at']

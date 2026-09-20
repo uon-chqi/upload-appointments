@@ -187,10 +187,11 @@ class Command(BaseCommand):
 
     def _report(self, run):
         run.refresh_from_db()
-        summary = '{} of {} facilities uploaded, {} records'.format(
+        summary = '{} of {} facilities uploaded, {} records, {} patient updates'.format(
             run.facilities_total - run.facilities_failed,
             run.facilities_total,
             run.records_uploaded,
+            run.patient_updates_uploaded,
         )
         if run.status == 'success':
             self.stdout.write(self.style.SUCCESS('Success: ' + summary))

@@ -198,6 +198,37 @@ class UploadPatientsTests(SimpleTestCase):
         self.assertEqual(log.save.call_count, 4)  # batches_total + 3 batches
 
 
+@override_settings(CHQI_API_BASE_URL='https://api.test')
+class UploadPatientUpdatesTests(SimpleTestCase):
+    """The second upload of each facility: where it posts, and how it shares a bar."""
+
+    @mock.patch('upload.services.requests.post')
+    def test_updates_go_to_the_update_endpoint(self, mock_post):
+        mock_post.return_value = make_response(200)
+
+        services.upload_patient_updates(
+            [{'patient_id': '1'}], make_tokens('t'), batch_size=10,
+        )
+
+        url = mock_post.call_args[0][0]
+        self.assertEqual(url, 'https://api.test/api/patients/update-json')
+
+    @mock.patch('upload.services.requests.post')
+    def test_a_second_phase_continues_the_first_phase_batch_numbering(self, mock_post):
+        mock_post.return_value = make_response(200)
+        log = mock.Mock(batches_total=0, batches_completed=0)
+
+        # Two batches of updates following four batches of appointments.
+        services.upload_patient_updates(
+            [{'patient_id': str(i)} for i in range(4)], make_tokens('t'), log=log,
+            batch_size=2, batch_offset=4, batches_total=6, progress_interval=0,
+        )
+
+        self.assertEqual(log.batches_total, 6)
+        # 5 then 6 — never back to 1, which would make the bar jump backwards.
+        self.assertEqual(log.batches_completed, 6)
+
+
 class BackoffDelayTests(SimpleTestCase):
     def test_stays_within_jitter_bounds(self):
         for attempt in range(1, 6):
@@ -813,6 +844,177 @@ class FetchAppointmentsQueryTests(SimpleTestCase):
             self.assertIn("x.status != 'Cancelled'", sql)
 
 
+class FetchPatientUpdatesTests(SimpleTestCase):
+    """The patient-detail query: what it selects, and what it maps to."""
+
+    COLUMNS = [
+        'patient_id', 'ccc_number', 'phone_number', 'facility_mfl', 'facility_name',
+        'consented', 'risk_classification_value', 'risk_classification',
+        'risk_factors', 'risk_classification_date', 'last_viral_load',
+        'last_viral_load_date', 'last_cd4', 'last_cd4_date',
+    ]
+
+    class Cursor:
+        def __init__(self, columns, rows):
+            self.description = [(name,) for name in columns]
+            self.rows = rows
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+        def fetchall(self):
+            return self.rows
+
+        def close(self):
+            pass
+
+    def _fetch(self, rows=()):
+        cursor = self.Cursor(self.COLUMNS, rows)
+        conn = mock.Mock()
+        conn.cursor.return_value = cursor
+        return openmrs.fetch_patient_updates(conn), cursor
+
+    def test_runs_unfiltered_by_date_so_every_run_refreshes_everybody(self):
+        _, cursor = self._fetch()
+        sql, params = cursor.executed[0]
+        self.assertNotIn('date_appointment_scheduled between', sql)
+        self.assertIsNone(params)
+
+    def test_keeps_the_consent_and_pending_filters(self):
+        self.assertIn("data.consented='Yes'", openmrs.PATIENT_UPDATE_QUERY)
+        self.assertIn('x.start_date_time > now()', openmrs.PATIENT_UPDATE_QUERY)
+        self.assertIn("x.status != 'Cancelled'", openmrs.PATIENT_UPDATE_QUERY)
+
+    def test_shares_its_ctes_with_the_appointment_query(self):
+        # One copy of the CTEs, so a fix to the viral-load logic reaches both.
+        for query in (openmrs.APPOINTMENT_QUERY, openmrs.PATIENT_UPDATE_QUERY):
+            self.assertIn(openmrs._COMMON_CTES, query)
+
+    def test_row_is_mapped_to_the_update_payload(self):
+        row = ('12', 'CCC-1', '0722000000', '15234', 'Kilifi County Hospital',
+               'Yes', '0.42', 'High Risk', 'missed appointments', '2026-09-01',
+               '0.00', '2026-08-02', '350', '2026-07-03')
+        patients, _ = self._fetch([row])
+
+        self.assertEqual(patients, [{
+            'patient_id': '12',
+            'ccc_number': 'CCC-1',
+            'facility_mfl': '15234',
+            'facility_name': 'Kilifi County Hospital',
+            'phone_number': '0722000000',
+            'risk_classification': 'High Risk',
+            'risk_classification_value': 0.42,
+            'risk_classification_date': '2026-09-01',
+            'risk_factors': 'missed appointments',
+            'last_viral_load': '0.00',
+            'last_viral_load_date': '2026-08-02',
+            'last_cd4': '350',
+            'last_cd4_date': '2026-07-03',
+        }])
+
+    def test_a_patient_never_scored_still_uploads(self):
+        # A blank risk score must not drop the row: the phone number is the point.
+        row = ('12', 'CCC-1', '0722000000', '15234', 'Kilifi', 'Yes',
+               None, None, None, None, None, None, None, None)
+        patients, _ = self._fetch([row])
+
+        self.assertEqual(patients[0]['risk_classification'], 'Unknown')
+        self.assertEqual(patients[0]['risk_classification_value'], 0.0)
+        self.assertEqual(patients[0]['last_viral_load'], '')
+
+
+@override_settings(CHQI_API_BASE_URL='https://api.test',
+                   FIELD_ENCRYPTION_KEY='unit-test-key',
+                   OPENMRS_DB_LABEL='Env facility', UPLOAD_BATCH_SIZE=2)
+class UploadFacilityTests(TestCase):
+    """Both halves of a facility's work: appointments, then patient updates."""
+
+    def setUp(self):
+        self.run = services.create_run(
+            date(2026, 9, 19), date(2026, 9, 20), triggered_by='cron', mode='single',
+        )
+        self.log = self.run.logs.get()
+        self.config = openmrs.FacilityConfig(
+            label='Env facility', host='db', port=3306, user='u', password='p',
+            database='openmrs',
+        )
+
+    @contextmanager
+    def _openmrs(self, appointments, updates):
+        conn = mock.Mock()
+        with mock.patch.object(openmrs, 'connect') as connect, \
+                mock.patch.object(openmrs, 'fetch_appointments',
+                                  return_value=appointments) as fetch_appts, \
+                mock.patch.object(openmrs, 'fetch_patient_updates',
+                                  return_value=updates) as fetch_updates:
+            connect.return_value.__enter__ = mock.Mock(return_value=conn)
+            connect.return_value.__exit__ = mock.Mock(return_value=False)
+            yield fetch_appts, fetch_updates
+
+    @mock.patch('upload.services.requests.post')
+    def test_both_endpoints_are_posted_to_and_both_counts_recorded(self, mock_post):
+        mock_post.return_value = make_response(200)
+        appointments = [{'patient_id': str(i)} for i in range(3)]
+        updates = [{'patient_id': str(i)} for i in range(2)]
+
+        with self._openmrs(appointments, updates):
+            services.upload_facility(self.log, self.config, make_tokens('t'))
+
+        urls = [call[0][0] for call in mock_post.call_args_list]
+        self.assertEqual(urls, [
+            'https://api.test/api/patients/upload-json',   # 2 batches of 2
+            'https://api.test/api/patients/upload-json',
+            'https://api.test/api/patients/update-json',   # 1 batch of 2
+        ])
+        self.log.refresh_from_db()
+        self.assertEqual(self.log.status, 'success')
+        self.assertEqual(self.log.records_uploaded, 3)
+        self.assertEqual(self.log.patient_updates_uploaded, 2)
+        # One bar across both phases, finishing full rather than at two-thirds.
+        self.assertEqual(self.log.batches_total, 3)
+        self.assertEqual(self.log.batches_completed, 3)
+
+    @mock.patch('upload.services.requests.post')
+    def test_updates_are_sent_even_when_nothing_was_booked_in_the_window(self, mock_post):
+        # The usual quiet night: nothing new booked, but risk scores moved.
+        mock_post.return_value = make_response(200)
+
+        with self._openmrs([], [{'patient_id': '1'}]):
+            services.upload_facility(self.log, self.config, make_tokens('t'))
+
+        urls = [call[0][0] for call in mock_post.call_args_list]
+        self.assertEqual(urls, ['https://api.test/api/patients/update-json'])
+        self.log.refresh_from_db()
+        self.assertEqual(self.log.status, 'success')
+        self.assertEqual(self.log.error_message, '')
+
+    @mock.patch('upload.services.requests.post')
+    def test_a_failed_update_upload_fails_the_facility(self, mock_post):
+        # Appointments through, updates rejected: the facility is not "done", and
+        # "Retry failed" is what re-runs it.
+        mock_post.side_effect = [make_response(200), make_response(400, text='bad')]
+
+        with self._openmrs([{'patient_id': '1'}], [{'patient_id': '1'}]):
+            services.upload_facility(self.log, self.config, make_tokens('t'))
+
+        self.log.refresh_from_db()
+        self.assertEqual(self.log.status, 'failed')
+        self.assertIn('HTTP 400', self.log.error_message)
+
+    @mock.patch('upload.services.requests.post')
+    def test_a_backfill_still_sends_the_unfiltered_patient_updates(self, mock_post):
+        mock_post.return_value = make_response(200)
+
+        with self._openmrs([{'patient_id': '1'}], [{'patient_id': '1'}]) as (appts, updates):
+            services.upload_facility(self.log, self.config, make_tokens('t'), backfill=True)
+
+        # The appointment half drops its dates for a backfill; the update half
+        # has no dates to drop.
+        self.assertEqual(appts.call_args[0][1:], ())
+        self.assertEqual(updates.call_count, 1)
+
+
 @override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility')
 class BackfillRunTests(TestCase):
     """The one-off initial load: when it runs, and when it counts as done."""
@@ -890,7 +1092,8 @@ class BackfillRunTests(TestCase):
             yield mock.Mock()
 
         with mock.patch.object(openmrs, 'connect', fake_connect), \
-                mock.patch.object(openmrs, 'fetch_appointments', return_value=[]) as fetch:
+                mock.patch.object(openmrs, 'fetch_appointments', return_value=[]) as fetch, \
+                mock.patch.object(openmrs, 'fetch_patient_updates', return_value=[]):
             services.upload_facility(log, facility.as_config(), mock.Mock(), backfill=True)
 
         # No date arguments at all — the backfill query takes none.
@@ -909,7 +1112,8 @@ class BackfillRunTests(TestCase):
             yield mock.Mock()
 
         with mock.patch.object(openmrs, 'connect', fake_connect), \
-                mock.patch.object(openmrs, 'fetch_appointments', return_value=[]) as fetch:
+                mock.patch.object(openmrs, 'fetch_appointments', return_value=[]) as fetch, \
+                mock.patch.object(openmrs, 'fetch_patient_updates', return_value=[]):
             services.upload_facility(log, facility.as_config(), mock.Mock())
 
         self.assertEqual(fetch.call_args[0][1:], (log.date_from, log.date_to))

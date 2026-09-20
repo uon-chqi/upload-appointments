@@ -76,6 +76,7 @@ Pair with _run_scripts.html, which drives everything here.
             <div><strong id="count-failed">0</strong> failed</div>
             <div><strong id="count-pending">0</strong> pending</div>
             <div><strong id="count-records">0</strong> records</div>
+            <div><strong id="count-updates">0</strong> patient updates</div>
         </div>
         <button type="button" class="expand-btn" id="toggle-detail" style="margin-top:10px; display:none">
             Show per-{{ unit }} detail
@@ -97,6 +98,7 @@ Pair with _run_scripts.html, which drives everything here.
                 <th>Status</th>
                 <th>{{ unit_plural|capfirst }}</th>
                 <th>Records</th>
+                <th>Patient updates</th>
                 <th>Time</th>
                 <th></th>
             </tr>
@@ -129,6 +131,7 @@ Pair with _run_scripts.html, which drives everything here.
                     {% endif %}
                 </td>
                 <td>{{ run.records_uploaded }}</td>
+                <td>{{ run.patient_updates_uploaded }}</td>
                 <td>{{ run.created_at|date:"Y-m-d H:i" }}</td>
                 <td>
                     {% if run.facilities_failed and not run.is_active %}
@@ -141,7 +144,7 @@ Pair with _run_scripts.html, which drives everything here.
                 </td>
             </tr>
             <tr class="detail-row" id="detail-{{ run.pk }}" style="display:none">
-                <td colspan="9"><div class="muted" style="padding:12px 0">Loading…</div></td>
+                <td colspan="10"><div class="muted" style="padding:12px 0">Loading…</div></td>
             </tr>
             {% endfor %}
         </tbody>

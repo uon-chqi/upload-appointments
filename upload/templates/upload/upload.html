@@ -90,6 +90,7 @@
                         <th>User</th>
                         <th>Status</th>
                         <th>Records</th>
+                        <th>Patient updates</th>
                         <th>Time</th>
                         <th>Error</th>
                     </tr>
@@ -116,6 +117,7 @@
                             </span>
                         </td>
                         <td>{{ log.records_uploaded }}</td>
+                        <td>{{ log.patient_updates_uploaded }}</td>
                         <td>{{ log.created_at|date:"Y-m-d H:i" }}</td>
                         <td>
                             {% if log.error_message %}
@@ -222,7 +224,8 @@
                     progressBar.style.width = pct + '%';
                     progressBar.textContent = pct + '%';
                     progressStatus.textContent = 'Uploading batch ' + facility.batches_completed +
-                        ' of ' + facility.batches_total + ' (' + facility.records_uploaded + ' records)';
+                        ' of ' + facility.batches_total + ' (' + facility.records_uploaded +
+                        ' records, ' + facility.patient_updates_uploaded + ' patient updates)';
                 } else if (data.status === 'in_progress') {
                     progressStatus.textContent = 'Querying appointments...';
                 }
@@ -232,7 +235,8 @@
                     progressBar.style.width = '100%';
                     progressBar.textContent = '100%';
                     progressBar.style.background = '#28a745';
-                    reset('Upload complete — ' + data.records_uploaded + ' records uploaded.', 'status-success');
+                    reset('Upload complete — ' + data.records_uploaded + ' records and ' +
+                          data.patient_updates_uploaded + ' patient updates uploaded.', 'status-success');
                     setTimeout(function() { location.reload(); }, 2000);
                 } else if (data.status === 'failed' || data.status === 'partial') {
                     clearInterval(interval);
