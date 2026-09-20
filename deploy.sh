@@ -288,47 +288,21 @@ systemctl restart "$SERVICE_NAME"
 echo "  Gunicorn service started on port $SERVER_PORT."
 
 # --- Set up cron job ---
-# Each facility uploads once a day at a RANDOM time in the 6pm–6am off-hours
-# window. With ~250 facilities all reporting to one central API, a fixed time
-# (e.g. 11pm) would cause a thundering-herd spike; spreading the start times
-# across the 12-hour idle window keeps peak concurrency low.
+# The entry itself is described by cron.sh, which update.sh also uses: the
+# schedule has to be something a push can change, or a facility nobody logs into
+# stays on whatever it was installed with for ever.
 #
-# The time is chosen ONCE at first install and preserved on later re-deploys,
-# so updating the app does not reshuffle this facility to a new slot.
-EXISTING_SCHEDULE=$(crontab -l 2>/dev/null | grep "upload_appointments" | head -n1 | awk '{print $1, $2, $3, $4, $5}' || true)
+# reconcile_cron preserves the minute this box already uploads on, so a
+# re-deploy does not reshuffle it, and only writes an entry once the installed
+# code understands it.
+echo "[9/9] Setting up cron job..."
+# shellcheck source=cron.sh
+. "$APP_DIR/cron.sh"
 
-if [[ -n "$EXISTING_SCHEDULE" ]]; then
-    CRON_SCHEDULE="$EXISTING_SCHEDULE"
-    echo "[9/9] Keeping existing upload schedule ($CRON_SCHEDULE)..."
-else
-    # Off-hours window 6pm–6am wraps midnight, so list the hours explicitly.
-    WINDOW_HOURS=(18 19 20 21 22 23 0 1 2 3 4 5)
-    RAND_HOUR=${WINDOW_HOURS[$((RANDOM % ${#WINDOW_HOURS[@]}))]}
-    RAND_MIN=$((RANDOM % 60))
-    CRON_SCHEDULE="$RAND_MIN $RAND_HOUR * * *"
-    echo "[9/9] Setting up cron job (random off-hours slot: $(printf '%02d:%02d' "$RAND_HOUR" "$RAND_MIN"))..."
-fi
-
-# Self-update first (best-effort: a failed pull must not stop the upload, so
-# the two are joined with ';' not '&&'), then run the daily upload. Pulling
-# immediately before uploading means each run uses the latest code — e.g. an
-# updated SQL query — without any manual redeploy at the facility.
-#
-# The upload runs as $SERVICE_USER, not root. In WAL mode SQLite keeps
-# db.sqlite3-wal and -shm alongside the database, and whichever user creates
-# them owns them — a root-owned WAL would lock the www-data web process out of
-# its own database. update.sh still needs root for systemctl.
-UPDATE_LOG="/var/log/upload-appointments-update.log"
-UPLOAD_CMD="$VENV_DIR/bin/python $APP_DIR/manage.py upload_appointments"
-CRON_CMD="cd $APP_DIR && bash $APP_DIR/update.sh >> $UPDATE_LOG 2>&1; su -s /bin/sh -c '$UPLOAD_CMD' $SERVICE_USER >> /var/log/upload-appointments.log 2>&1"
-CRON_LINE="$CRON_SCHEDULE $CRON_CMD"
-
-# Remove any existing cron entry for this app, then add the new one
-(crontab -l 2>/dev/null | grep -v "upload_appointments" || true; echo "$CRON_LINE") | crontab -
-touch /var/log/upload-appointments.log "$UPDATE_LOG"
-chmod 666 /var/log/upload-appointments.log "$UPDATE_LOG"
-echo "  Cron job installed: $CRON_SCHEDULE"
-echo "  Upload log: /var/log/upload-appointments.log"
+touch "$UPLOAD_LOG" "$UPDATE_LOG"
+chmod 666 "$UPLOAD_LOG" "$UPDATE_LOG"
+reconcile_cron | sed 's/^/  /'
+echo "  Upload log: $UPLOAD_LOG"
 echo "  Update log: $UPDATE_LOG"
 
 echo
@@ -341,8 +315,8 @@ echo "  Virtual env:   $VENV_DIR"
 echo "  Config:        $ENV_FILE"
 echo "  Service:       systemctl status $SERVICE_NAME"
 echo "  Running on:    http://0.0.0.0:$SERVER_PORT"
-echo "  Cron:          Daily at $CRON_SCHEDULE (random off-hours slot)"
-echo "  Log:           /var/log/upload-appointments.log"
+echo "  Cron:          $(cron_schedule "$(cron_offset)") (uploads whatever is behind)"
+echo "  Log:           $UPLOAD_LOG"
 echo
 echo "  Useful commands:"
 echo "    sudo systemctl status $SERVICE_NAME    # Check service status"

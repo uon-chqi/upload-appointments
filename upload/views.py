@@ -51,8 +51,31 @@ def _serialize_run(run):
     }
 
 
+def _windows_from(logs):
+    """Give a retry each facility's own period back, rather than the run's.
+
+    A catch-up run's facilities do not share a window — one was a day behind, the
+    next a week, and a third had never been uploaded at all — so the run's dates
+    are only the envelope of them. Retrying from that envelope would hand most
+    facilities more than they need and, worse, hand the one that needed every
+    pending appointment a mere date range instead.
+    """
+    periods = {
+        log.facility_id: None if log.is_backfill else (log.date_from, log.date_to)
+        for log in logs
+    }
+
+    def windows(facility):
+        # None means "everything pending", which is also what a facility missing
+        # from the map would give — and none can be, since the facilities being
+        # retried come from these very logs.
+        return periods.get(facility.pk if facility else None)
+
+    return windows
+
+
 def _start_run(request, mode, dates=None, facilities=None, retry_of=None,
-               is_backfill=False):
+               is_backfill=False, windows=None):
     """Create a run and hand it to a detached process, refusing to overlap.
 
     `dates` short-circuits form validation for retries, which reuse the original
@@ -99,6 +122,7 @@ def _start_run(request, mode, dates=None, facilities=None, retry_of=None,
         facilities=facilities,
         retry_of=retry_of,
         is_backfill=is_backfill,
+        windows=windows,
     )
     services.spawn_run(run.pk)
     return JsonResponse({'run_id': run.pk})
@@ -293,10 +317,8 @@ def backfill_upload(request):
 def run_retry_failed(request, run_id):
     """Re-upload only the facilities that failed in a previous run."""
     run = get_object_or_404(UploadRun, pk=run_id)
-    facilities = [
-        log.facility for log in run.logs.filter(status='failed').select_related('facility')
-        if log.facility_id
-    ]
+    failed = list(run.logs.filter(status='failed').select_related('facility'))
+    facilities = [log.facility for log in failed if log.facility_id]
     if not facilities:
         return JsonResponse(
             {'error': 'No failed facilities left to retry.'}, status=400,
@@ -311,8 +333,10 @@ def run_retry_failed(request, run_id):
         facilities=facilities,
         retry_of=run,
         # Retrying a backfill must re-run the backfill: the stored dates are the
-        # day it ran, not a window worth re-querying.
+        # day it ran, not a window worth re-querying. Per facility, because one
+        # run can hold both.
         is_backfill=run.is_backfill,
+        windows=_windows_from(failed),
     )
 
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Self-update for a facility instance: pull the latest code and, only if the
-# commit actually changed, reinstall dependencies, apply migrations, refresh
-# static files, and restart the service.
+# Self-update for a facility instance: bring the crontab in line with the repo,
+# pull the latest code, and — only if the commit actually changed — reinstall
+# dependencies, apply migrations, refresh static files, and restart the service.
 #
-# Safe to run repeatedly (idempotent) and safe to run from cron — when nothing
-# has changed it does almost no work. Designed to be run as root (the service
-# restart needs systemctl).
+# Safe to run repeatedly (idempotent) and safe to run from cron, which now calls
+# it twice an hour rather than nightly: a tick that finds the crontab correct and
+# the last pull recent exits in milliseconds without touching the network.
+# Designed to be run as root (the service restart and the crontab need it).
 #
 #   sudo bash /opt/upload-appointments/update.sh
 #
@@ -17,8 +18,28 @@ VENV_DIR="$APP_DIR/venv"
 SERVICE_NAME="upload-appointments"
 SERVICE_USER="www-data"
 LOCK_FILE="/var/lock/upload-appointments-update.lock"
+FETCH_STAMP="/var/lock/upload-appointments-last-fetch"
+
+# How long to leave the remote alone between pulls. The cron entry now ticks
+# twice an hour so that a facility which is only switched on during the day still
+# gets a chance to update; that is no reason to ask GitHub forty-eight times a
+# day from each of ~250 boxes. The stamp usually lives on a tmpfs, so a reboot
+# clears it and a machine switched on in the morning checks for updates promptly.
+FETCH_INTERVAL_HOURS="${UPDATE_FETCH_INTERVAL_HOURS:-6}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# The crontab is described by cron.sh in the repo, so that changing the schedule
+# is a push rather than a visit to every facility. Called before the pull as well
+# as after it: a box that took the new code on an earlier run but whose crontab
+# somehow did not follow fixes itself on the next tick, without waiting for
+# another commit to land.
+maybe_reconcile_cron() {
+    [[ -f "$APP_DIR/cron.sh" ]] || return 0
+    # shellcheck source=cron.sh
+    . "$APP_DIR/cron.sh"
+    reconcile_cron | while read -r line; do log "$line"; done
+}
 
 # --- Only one update at a time (cron + a manual run must not overlap) ---
 exec 200>"$LOCK_FILE"
@@ -33,6 +54,14 @@ git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 
 cd "$APP_DIR"
 
+maybe_reconcile_cron
+
+# Nothing below this point is worth doing on every tick.
+if [[ -f "$FETCH_STAMP" ]] &&
+   [[ -n "$(find "$FETCH_STAMP" -newermt "-$FETCH_INTERVAL_HOURS hours" 2>/dev/null)" ]]; then
+    exit 0
+fi
+
 BEFORE=$(git rev-parse HEAD)
 log "Current revision: $BEFORE"
 
@@ -44,6 +73,9 @@ if ! git fetch origin main; then
     log "ERROR: git fetch failed (no network?). Leaving instance on $BEFORE."
     exit 1
 fi
+# Stamped on a successful fetch only, so a box that has been offline all morning
+# tries again on the next tick rather than waiting out the interval.
+touch "$FETCH_STAMP"
 git reset --hard origin/main
 
 AFTER=$(git rev-parse HEAD)
@@ -111,5 +143,9 @@ systemctl restart "$SERVICE_NAME"
 
 # Past the point where rolling back would help: the new revision is live.
 trap - ERR
+
+# Again, now that the new revision is installed and migrated: this is the call
+# that moves a box onto a schedule the previous revision did not support.
+maybe_reconcile_cron
 
 log "Update complete; service restarted on revision $AFTER."

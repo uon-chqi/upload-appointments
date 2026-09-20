@@ -45,6 +45,17 @@ class AppSettings(models.Model):
         related_name='+',
     )
 
+    # Catch-up state for the environment-configured facility, which has no
+    # Facility row of its own. The same three fields exist on Facility; see
+    # upload.schedule for what they mean and who moves them.
+    appointments_synced_through = models.DateField(
+        null=True, blank=True,
+        help_text='Last day whose bookings reached the platform. The next '
+                  'catch-up window starts here.',
+    )
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    consecutive_failures = models.PositiveIntegerField(default=0)
+
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -213,6 +224,18 @@ class Facility(models.Model):
     # facility as well as deployment-wide, because a backfill across a hundred
     # containers will normally leave a few behind for the operator to retry.
     initial_backfill_at = models.DateTimeField(null=True, blank=True)
+    # How far this facility's appointments have got, and how its last attempt
+    # went. Together these are what let a facility that was switched off for
+    # three nights ask for those three nights rather than the last one, and what
+    # stops a container that is simply unplugged being retried every half hour
+    # until midnight. See upload.schedule.
+    appointments_synced_through = models.DateField(
+        null=True, blank=True,
+        help_text='Last day whose bookings reached the platform for this '
+                  'facility. The next catch-up window starts here.',
+    )
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    consecutive_failures = models.PositiveIntegerField(default=0)
     last_tested_at = models.DateTimeField(null=True, blank=True)
     last_test_ok = models.BooleanField(null=True, blank=True)
     last_test_message = models.TextField(blank=True, default='')
@@ -380,6 +403,11 @@ class UploadLog(models.Model):
 
     date_from = models.DateField(help_text='Start date of the query period')
     date_to = models.DateField(help_text='End date of the query period')
+    # Per facility, not per run: a catch-up run can hold one facility a day
+    # behind, another a week behind, and a third nobody has ever uploaded, which
+    # needs every pending appointment rather than any window at all. The run's
+    # own flag stays the summary — true only when every log in it is a backfill.
+    is_backfill = models.BooleanField(default=False)
     triggered_by = models.CharField(max_length=10, choices=TRIGGER_CHOICES)
     triggered_by_user = models.ForeignKey(
         'auth.User', null=True, blank=True, on_delete=models.SET_NULL,
@@ -400,5 +428,11 @@ class UploadLog(models.Model):
     class Meta:
         ordering = ['-created_at']
 
+    @property
+    def period_label(self):
+        if self.is_backfill:
+            return 'All pending appointments'
+        return '{} to {}'.format(self.date_from, self.date_to)
+
     def __str__(self):
-        return f"{self.date_from} to {self.date_to} — {self.status} ({self.triggered_by})"
+        return f"{self.period_label} — {self.status} ({self.triggered_by})"

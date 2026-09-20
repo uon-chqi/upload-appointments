@@ -62,7 +62,7 @@ The installer takes a few minutes and will:
 6. Collect the static web files.
 7. Create the admin user.
 8. Start the background service on port **9162**.
-9. Schedule the daily upload (cron, 11:00 PM).
+9. Schedule the automatic upload (cron, twice an hour).
 
 When it finishes you will see a `Deployment complete!` summary.
 
@@ -89,11 +89,21 @@ Log in with:
 
 From the dashboard you can trigger an upload manually and watch its progress.
 
-## Daily automatic upload
+## Automatic upload
 
-A scheduled job (cron) runs the upload automatically every day at **11:00 PM**
-and uploads the previous day's appointments. No action is needed for this to
-happen.
+A scheduled job (cron) checks **twice an hour, day and night**, whether this
+facility still owes an upload, and runs one if it does. No action is needed for
+this to happen.
+
+It works this way so that a facility which switches its machine off overnight,
+or whose internet is only available for part of the day, still uploads: whichever
+check finds the machine on and the connection working is the one that does the
+work, whatever time of day that turns out to be.
+
+Nothing is uploaded twice. Each check knows the last day already sent, so a
+machine that has been off for three days uploads those three days when it next
+comes on, and a machine that has already uploaded today does nothing until
+tomorrow. Most checks find nothing to do and finish in a few seconds.
 
 To check what the daily upload did, view its log:
 

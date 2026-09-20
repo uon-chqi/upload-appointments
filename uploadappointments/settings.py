@@ -172,6 +172,21 @@ TENANT_PROBE_WORKERS = int(os.environ.get('TENANT_PROBE_WORKERS', '8'))
 # A run whose heartbeat goes quiet for this long is assumed dead.
 UPLOAD_STALE_MINUTES = int(os.environ.get('UPLOAD_STALE_MINUTES', '20'))
 
+# --- the due-check (`upload_appointments --due-only`), see upload/schedule.py ---
+# How far behind a facility may fall before its catch-up window is abandoned in
+# favour of the unfiltered backfill query. Only future appointments are ever
+# uploaded, so a window this wide already returns much what the backfill does —
+# and the backfill is the cheaper query, having no date predicate.
+UPLOAD_CATCH_UP_DAYS = int(os.environ.get('UPLOAD_CATCH_UP_DAYS', '30'))
+# How long a facility is left alone after a failure, doubling each time up to the
+# ceiling. The base wants to be about one tick — retry on the next pass — and the
+# ceiling low enough that a machine switched on at lunchtime still uploads today.
+UPLOAD_RETRY_BASE_MINUTES = int(os.environ.get('UPLOAD_RETRY_BASE_MINUTES', '30'))
+UPLOAD_RETRY_MAX_MINUTES = int(os.environ.get('UPLOAD_RETRY_MAX_MINUTES', '120'))
+# Seconds allowed for the TCP check that decides whether there is any link to the
+# platform at all. Short: a tick that finds no internet should cost nothing.
+UPLOAD_CONNECT_CHECK_SECONDS = int(os.environ.get('UPLOAD_CONNECT_CHECK_SECONDS', '5'))
+
 # Encrypts facility MySQL passwords at rest. Falls back to SECRET_KEY when unset;
 # rotating whichever is in use means re-entering every facility password.
 FIELD_ENCRYPTION_KEY = os.environ.get('FIELD_ENCRYPTION_KEY', '')

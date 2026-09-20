@@ -5,7 +5,10 @@ from .models import AppSettings, Facility, TenantServer, UploadLog, UploadRun
 
 @admin.register(AppSettings)
 class AppSettingsAdmin(admin.ModelAdmin):
-    list_display = ['multi_facility_enabled', 'multi_tenant_enabled', 'updated_at']
+    list_display = ['multi_facility_enabled', 'multi_tenant_enabled',
+                    'appointments_synced_through', 'updated_at']
+    readonly_fields = ['appointments_synced_through', 'last_attempt_at',
+                       'consecutive_failures']
 
     def has_add_permission(self, request):
         return not AppSettings.objects.exists()
@@ -29,18 +32,22 @@ class TenantServerAdmin(admin.ModelAdmin):
 @admin.register(Facility)
 class FacilityAdmin(admin.ModelAdmin):
     list_display = ['name', 'server', 'host', 'port', 'database_name', 'mfl_code',
-                    'is_active', 'last_test_ok']
+                    'is_active', 'appointments_synced_through', 'last_test_ok']
     list_filter = ['is_active', 'last_test_ok', 'server']
     search_fields = ['name', 'host', 'mfl_code', 'database_name']
     # password_encrypted is deliberately absent: nothing should render it.
     fields = ['name', 'server', 'host', 'port', 'database_name', 'username', 'is_active',
               'mfl_code', 'mfl_facility_name', 'disabled_by_sync', 'activated_at',
               'last_seen_at',
+              'appointments_synced_through', 'last_attempt_at', 'consecutive_failures',
               'last_tested_at', 'last_test_ok', 'last_test_message']
-    # Discovered rows are sync's to write; editing them here would be undone.
+    # Discovered rows are sync's to write; editing them here would be undone. The
+    # catch-up state is the upload's to write for the same reason — clearing the
+    # watermark by hand is asking for a full re-upload of that facility.
     readonly_fields = ['server', 'mfl_code', 'mfl_facility_name', 'disabled_by_sync',
-                       'activated_at', 'last_seen_at', 'last_tested_at', 'last_test_ok',
-                       'last_test_message']
+                       'activated_at', 'last_seen_at', 'appointments_synced_through',
+                       'last_attempt_at', 'consecutive_failures',
+                       'last_tested_at', 'last_test_ok', 'last_test_message']
 
 
 class UploadLogInline(admin.TabularInline):
@@ -64,12 +71,13 @@ class UploadRunAdmin(admin.ModelAdmin):
 
 @admin.register(UploadLog)
 class UploadLogAdmin(admin.ModelAdmin):
-    list_display = ['date_from', 'date_to', 'facility_label', 'triggered_by',
-                    'triggered_by_user', 'status', 'records_uploaded',
+    list_display = ['date_from', 'date_to', 'is_backfill', 'facility_label',
+                    'triggered_by', 'triggered_by_user', 'status', 'records_uploaded',
                     'patient_updates_uploaded', 'created_at']
     list_filter = ['status', 'triggered_by', 'created_at']
     search_fields = ['error_message', 'facility_label']
     readonly_fields = ['run', 'facility', 'facility_label', 'date_from', 'date_to',
+                       'is_backfill',
                        'triggered_by', 'triggered_by_user', 'status', 'records_uploaded',
                        'patient_updates_uploaded', 'batches_total', 'batches_completed',
                        'error_message',

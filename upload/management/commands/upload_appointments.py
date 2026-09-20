@@ -2,8 +2,9 @@ import sys
 from datetime import date, timedelta
 
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 
-from upload import services, tenants
+from upload import openmrs, schedule, services, tenants
 from upload.models import AppSettings, Facility, TenantServer, UploadRun
 
 
@@ -51,12 +52,23 @@ class Command(BaseCommand):
             help='In multi-tenant mode, upload the schemas already known instead '
                  'of asking the servers what they hold first.',
         )
+        parser.add_argument(
+            '--due-only',
+            action='store_true',
+            help='Upload only the facilities that are behind, each for the period '
+                 'it actually missed. Exits quietly when there is nothing to do, '
+                 'so it can be run every half hour from cron.',
+        )
 
     def handle(self, *args, **options):
         services.mark_stale_runs()
 
         if options['run_id']:
             run = self._load_run(options['run_id'])
+        elif options['due_only']:
+            run = self._create_due_run(options)
+            if run is None:
+                return
         else:
             run = self._create_run(options)
 
@@ -160,6 +172,86 @@ class Command(BaseCommand):
         return services.create_run(
             date_from, date_to, triggered_by='cron', mode=mode,
             is_backfill=is_backfill,
+        )
+
+    def _create_due_run(self, options):
+        """The frequent tick: upload whatever is behind, or nothing at all.
+
+        Returns None when there is nothing to do, which is the common case. Every
+        way of declining exits 0 and writes only to stdout, never stderr, so a
+        crontab entry redirecting stdout to /dev/null mails on real failures and
+        stays silent the rest of the day. Run every half hour, anything else is
+        forty-eight mails a day and an operator who reads none of them.
+
+        The order matters. Connectivity is checked before a run is created, so an
+        afternoon with no internet leaves no trace rather than a failed run every
+        thirty minutes; and the facilities are picked by what they owe rather
+        than by the clock, so a machine switched on at two in the afternoon
+        uploads then, for the nights it was off.
+        """
+        if options['backfill'] or options['date_from'] or options['date_to']:
+            raise CommandError(
+                "--due-only works out each facility's period from what it last "
+                'uploaded, so it takes neither --backfill nor a date range.'
+            )
+        if options['facility']:
+            raise CommandError(
+                '--due-only covers every facility that is behind. To re-run one, '
+                'use --facility on its own.'
+            )
+
+        # Not an error, unlike the nightly path: at this cadence a tick landing
+        # inside a long run is routine, and cron mails anything that exits 1.
+        running = services.active_run()
+        if running:
+            self.stdout.write(
+                'Upload run {} is still in progress; nothing to do.'.format(running.pk)
+            )
+            return None
+
+        reachable, why = services.platform_reachable()
+        if not reachable:
+            self.stdout.write(self.style.WARNING(
+                'No link to the platform: {} Nothing attempted — the facilities '
+                'are not behind, the internet is.'.format(why)
+            ))
+            return None
+
+        mode = AppSettings.load().cron_mode()
+        if mode == 'tenant' and not options['no_sync']:
+            # Not _sync_tenants' own guard, which raises: a deployment configured
+            # wrongly should say so once a tick and let the tick end quietly, not
+            # exit 1 and mail the operator every half hour about it.
+            if TenantServer.objects.filter(is_active=True).exists():
+                self._sync_tenants(options.get('workers'))
+            else:
+                self.stdout.write(self.style.WARNING(
+                    'Multi-tenant mode is enabled but no active tenant servers '
+                    'are configured; there is nothing to discover or upload.'
+                ))
+                return None
+
+        targets = schedule.due_targets(mode)
+        if not targets:
+            self.stdout.write('Every facility is up to date; nothing to upload.')
+            return None
+
+        for facility in targets:
+            window = schedule.window_for(facility)
+            self.stdout.write('  {}: {}'.format(
+                facility.name if facility else openmrs.env_config().label,
+                'all pending' if window is None
+                else '{} to {}'.format(window[0], window[1]),
+            ))
+
+        # The dates passed here are only the fallback for a facility whose window
+        # is "everything pending", where they record the day the run happened;
+        # every other log gets its own period from window_for.
+        today = timezone.localdate()
+        return services.create_run(
+            today, today, triggered_by='cron', mode=mode,
+            facilities=targets if mode in UploadRun.MULTI_MODES else None,
+            windows=schedule.window_for,
         )
 
     def _sync_tenants(self, workers):

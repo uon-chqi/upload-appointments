@@ -1,16 +1,20 @@
 from contextlib import contextmanager
 from datetime import date, timedelta
+from io import StringIO
 from unittest import mock
 
 import requests
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import Client, SimpleTestCase, TestCase, override_settings
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
+from django.test import (Client, SimpleTestCase, TestCase, TransactionTestCase,
+                         override_settings)
 from django.urls import reverse
 from django.utils import timezone
 
-from upload import crypto, openmrs, services, tenants
+from upload import crypto, openmrs, schedule, services, tenants
 from upload.models import AppSettings, Facility, TenantServer, UploadLog, UploadRun
 
 
@@ -1978,3 +1982,852 @@ class UploadCommandTenantTests(TestCase):
             call_command('upload_appointments', facility=facility.pk)
 
         self.assertEqual(UploadRun.objects.get().mode, 'tenant')
+
+
+# ------------------------------------------------------- catch-up scheduling
+
+@override_settings(UPLOAD_CATCH_UP_DAYS=30, UPLOAD_RETRY_BASE_MINUTES=30,
+                   UPLOAD_RETRY_MAX_MINUTES=120)
+class CatchUpWindowTests(TestCase):
+    """What period a facility is asked for, given how far behind it is."""
+
+    def _facility(self, name='Kilifi', **kwargs):
+        return Facility.objects.create(
+            name=name, host='h', username='u', password_encrypted='x', **kwargs,
+        )
+
+    def test_a_facility_never_uploaded_gets_everything_pending(self):
+        self.assertIsNone(schedule.window_for(self._facility()))
+
+    def test_a_facility_uploaded_yesterday_gets_the_same_window_as_before(self):
+        # The nightly job's yesterday-to-today window, reproduced exactly: a
+        # healthy facility must see no change at all from the catch-up machinery.
+        today = date(2026, 9, 20)
+        facility = self._facility(appointments_synced_through=today - timedelta(days=1))
+
+        self.assertEqual(
+            schedule.window_for(facility, today=today),
+            (date(2026, 9, 19), date(2026, 9, 20)),
+        )
+
+    def test_three_nights_switched_off_asks_for_three_nights(self):
+        today = date(2026, 9, 20)
+        facility = self._facility(appointments_synced_through=today - timedelta(days=3))
+
+        self.assertEqual(
+            schedule.window_for(facility, today=today),
+            (date(2026, 9, 17), date(2026, 9, 20)),
+        )
+
+    def test_a_facility_far_enough_behind_falls_back_to_the_backfill(self):
+        today = date(2026, 9, 20)
+        facility = self._facility(appointments_synced_through=today - timedelta(days=31))
+
+        self.assertIsNone(schedule.window_for(facility, today=today))
+
+    def test_the_cut_off_day_itself_is_still_a_window(self):
+        today = date(2026, 9, 20)
+        facility = self._facility(appointments_synced_through=today - timedelta(days=30))
+
+        self.assertEqual(schedule.window_for(facility, today=today)[0],
+                         date(2026, 8, 21))
+
+    def test_a_watermark_ahead_of_today_never_makes_a_backwards_window(self):
+        # A clock that has gone backwards must not produce date_from > date_to,
+        # which would match nothing at all and look like a quiet success.
+        today = date(2026, 9, 20)
+        facility = self._facility(appointments_synced_through=date(2026, 9, 25))
+
+        window = schedule.window_for(facility, today=today)
+
+        self.assertLessEqual(window[0], window[1])
+
+    def test_the_env_facility_keeps_its_watermark_on_the_settings_row(self):
+        # Single-facility mode has no Facility row at all; None is the env one.
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'appointments_synced_through': date(2026, 9, 18)},
+        )
+
+        self.assertEqual(
+            schedule.window_for(None, today=date(2026, 9, 20)),
+            (date(2026, 9, 18), date(2026, 9, 20)),
+        )
+
+
+@override_settings(UPLOAD_RETRY_BASE_MINUTES=30, UPLOAD_RETRY_MAX_MINUTES=120)
+class DueCheckTests(TestCase):
+    """Which facilities a tick picks up, and how hard it retries the broken ones."""
+
+    def setUp(self):
+        self.now = timezone.now()
+        self.today = timezone.localdate(self.now)
+
+    def _facility(self, name='Kilifi', **kwargs):
+        return Facility.objects.create(
+            name=name, host='h', username='u', password_encrypted='x', **kwargs,
+        )
+
+    def test_a_facility_already_uploaded_today_is_not_due_again(self):
+        facility = self._facility(appointments_synced_through=self.today)
+
+        self.assertFalse(schedule.is_due(facility, now=self.now))
+
+    def test_a_facility_uploaded_yesterday_is_due(self):
+        facility = self._facility(
+            appointments_synced_through=self.today - timedelta(days=1),
+        )
+
+        self.assertTrue(schedule.is_due(facility, now=self.now))
+
+    def test_a_facility_nobody_has_uploaded_is_due(self):
+        self.assertTrue(schedule.is_due(self._facility(), now=self.now))
+
+    def test_it_makes_no_difference_what_time_of_day_the_machine_came_on(self):
+        # The whole point: a container switched on at 14:20 uploads at 14:20.
+        facility = self._facility(
+            appointments_synced_through=self.today - timedelta(days=1),
+        )
+        afternoon = self.now.replace(hour=14, minute=20)
+
+        self.assertTrue(schedule.is_due(facility, now=afternoon))
+
+    def test_a_facility_that_just_failed_is_left_alone_for_one_interval(self):
+        facility = self._facility(
+            appointments_synced_through=self.today - timedelta(days=1),
+            last_attempt_at=self.now - timedelta(minutes=10),
+            consecutive_failures=1,
+        )
+
+        self.assertFalse(schedule.is_due(facility, now=self.now))
+
+    def test_it_is_tried_again_once_the_interval_has_passed(self):
+        facility = self._facility(
+            appointments_synced_through=self.today - timedelta(days=1),
+            last_attempt_at=self.now - timedelta(minutes=31),
+            consecutive_failures=1,
+        )
+
+        self.assertTrue(schedule.is_due(facility, now=self.now))
+
+    def test_each_failure_doubles_the_wait_up_to_the_ceiling(self):
+        self.assertEqual(schedule.retry_delay(1), 30)
+        self.assertEqual(schedule.retry_delay(2), 60)
+        self.assertEqual(schedule.retry_delay(3), 120)
+        # Capped, so a machine coming online at lunchtime still uploads today.
+        self.assertEqual(schedule.retry_delay(9), 120)
+
+    def test_a_facility_whose_last_attempt_worked_is_not_held_back(self):
+        # Zero failures means no wait: a successful upload this morning followed
+        # by a new day must not be delayed by the morning's timestamp.
+        facility = self._facility(
+            appointments_synced_through=self.today - timedelta(days=1),
+            last_attempt_at=self.now - timedelta(minutes=1),
+            consecutive_failures=0,
+        )
+
+        self.assertTrue(schedule.is_due(facility, now=self.now))
+
+    def test_due_targets_skips_inactive_facilities(self):
+        self._facility('Kilifi')
+        self._facility('Malindi', is_active=False)
+
+        targets = schedule.due_targets('multi', now=self.now)
+
+        self.assertEqual([f.name for f in targets], ['Kilifi'])
+
+    def test_due_targets_in_single_mode_is_the_env_facility(self):
+        self.assertEqual(schedule.due_targets('single', now=self.now), [None])
+
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'appointments_synced_through': self.today},
+        )
+        self.assertEqual(schedule.due_targets('single', now=self.now), [])
+
+    def test_due_targets_does_not_mix_tenants_into_a_multi_facility_tick(self):
+        server = TenantServer.objects.create(
+            name='Cloud', host='h', username='u', password_encrypted='x',
+        )
+        self._facility('Standalone')
+        self._facility('Tenant', server=server, database_name='openmrs_kilifi')
+
+        self.assertEqual([f.name for f in schedule.due_targets('multi', now=self.now)],
+                         ['Standalone'])
+        self.assertEqual([f.name for f in schedule.due_targets('tenant', now=self.now)],
+                         ['Tenant'])
+
+
+class RecordAttemptTests(TestCase):
+    """How an attempt's outcome moves the catch-up state."""
+
+    def _facility(self):
+        return Facility.objects.create(
+            name='Kilifi', host='h', username='u', password_encrypted='x',
+        )
+
+    def test_success_advances_the_watermark_and_clears_the_failures(self):
+        facility = self._facility()
+        Facility.objects.filter(pk=facility.pk).update(consecutive_failures=3)
+
+        schedule.record_attempt(facility.pk, ok=True, synced_through=date(2026, 9, 20))
+
+        facility.refresh_from_db()
+        self.assertEqual(facility.appointments_synced_through, date(2026, 9, 20))
+        self.assertEqual(facility.consecutive_failures, 0)
+        self.assertIsNotNone(facility.last_attempt_at)
+
+    def test_failure_leaves_the_watermark_owing_and_counts_up(self):
+        facility = self._facility()
+        Facility.objects.filter(pk=facility.pk).update(
+            appointments_synced_through=date(2026, 9, 17),
+        )
+
+        schedule.record_attempt(facility.pk, ok=False)
+        schedule.record_attempt(facility.pk, ok=False)
+
+        facility.refresh_from_db()
+        # Still owed: the next successful run collects these days too.
+        self.assertEqual(facility.appointments_synced_through, date(2026, 9, 17))
+        self.assertEqual(facility.consecutive_failures, 2)
+
+    def test_the_watermark_never_moves_backwards(self):
+        # Re-uploading some week in January is a legitimate thing to ask for and
+        # must not convince the nightly job that January is where we have got to.
+        facility = self._facility()
+        Facility.objects.filter(pk=facility.pk).update(
+            appointments_synced_through=date(2026, 9, 20),
+        )
+
+        schedule.record_attempt(facility.pk, ok=True, synced_through=date(2026, 1, 5))
+
+        facility.refresh_from_db()
+        self.assertEqual(facility.appointments_synced_through, date(2026, 9, 20))
+
+    def test_the_env_facility_records_against_the_settings_row(self):
+        schedule.record_attempt(None, ok=True, synced_through=date(2026, 9, 20))
+
+        app_settings = AppSettings.load()
+        self.assertEqual(app_settings.appointments_synced_through, date(2026, 9, 20))
+        self.assertEqual(app_settings.consecutive_failures, 0)
+
+        schedule.record_attempt(None, ok=False)
+
+        app_settings.refresh_from_db()
+        self.assertEqual(app_settings.consecutive_failures, 1)
+        self.assertEqual(app_settings.appointments_synced_through, date(2026, 9, 20))
+
+
+class PlatformReachableTests(SimpleTestCase):
+    """The cheap link check that decides whether a tick is worth attempting."""
+
+    @override_settings(CHQI_API_BASE_URL='https://api.test/v1')
+    def test_a_successful_connect_uses_the_scheme_default_port(self):
+        with mock.patch.object(services.socket, 'create_connection') as connect:
+            ok, why = services.platform_reachable()
+
+        self.assertTrue(ok)
+        self.assertEqual(why, '')
+        self.assertEqual(connect.call_args[0][0], ('api.test', 443))
+        connect.return_value.close.assert_called_once()
+
+    @override_settings(CHQI_API_BASE_URL='http://10.0.0.5:8080')
+    def test_an_explicit_port_wins_over_the_scheme(self):
+        with mock.patch.object(services.socket, 'create_connection') as connect:
+            services.platform_reachable()
+
+        self.assertEqual(connect.call_args[0][0], ('10.0.0.5', 8080))
+
+    @override_settings(CHQI_API_BASE_URL='https://api.test')
+    def test_an_unreachable_platform_is_reported_not_raised(self):
+        with mock.patch.object(services.socket, 'create_connection',
+                               side_effect=OSError('Network is unreachable')):
+            ok, why = services.platform_reachable()
+
+        self.assertFalse(ok)
+        self.assertIn('Network is unreachable', why)
+
+    @override_settings(CHQI_API_BASE_URL='')
+    def test_an_unconfigured_platform_is_not_reachable(self):
+        ok, why = services.platform_reachable()
+
+        self.assertFalse(ok)
+        self.assertIn('not configured', why)
+
+    @override_settings(CHQI_API_BASE_URL='api.test')
+    def test_a_url_with_no_host_is_reported_rather_than_dialled(self):
+        # urlparse puts a bare hostname in `path`, leaving `hostname` None.
+        with mock.patch.object(services.socket, 'create_connection') as connect:
+            ok, why = services.platform_reachable()
+
+        self.assertFalse(ok)
+        self.assertIn('not a usable URL', why)
+        connect.assert_not_called()
+
+    @override_settings(CHQI_API_BASE_URL='https://api.test',
+                       UPLOAD_CONNECT_CHECK_SECONDS=5)
+    def test_the_check_is_kept_short(self):
+        # It runs every tick; a tick that finds no internet must cost nothing.
+        with mock.patch.object(services.socket, 'create_connection') as connect:
+            services.platform_reachable()
+
+        self.assertEqual(connect.call_args[1]['timeout'], 5)
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key')
+class PerFacilityWindowTests(TestCase):
+    """One run, facilities at different distances behind."""
+
+    def _facility(self, name, **kwargs):
+        facility = Facility.objects.create(name=name, host='h', username='u', **kwargs)
+        facility.set_password('pw')
+        facility.save()
+        return facility
+
+    def test_each_log_gets_its_own_period_and_the_run_gets_the_envelope(self):
+        behind_a_day = self._facility('Kilifi')
+        behind_a_week = self._facility('Malindi')
+        windows = {
+            'Kilifi': (date(2026, 9, 19), date(2026, 9, 20)),
+            'Malindi': (date(2026, 9, 13), date(2026, 9, 20)),
+        }
+
+        run = services.create_run(
+            date(2026, 9, 20), date(2026, 9, 20), triggered_by='cron', mode='multi',
+            facilities=[behind_a_day, behind_a_week],
+            windows=lambda facility: windows[facility.name],
+        )
+
+        logs = {log.facility_label: log for log in run.logs.all()}
+        self.assertEqual(logs['Kilifi'].date_from, date(2026, 9, 19))
+        self.assertEqual(logs['Malindi'].date_from, date(2026, 9, 13))
+        # The run reads as the widest of them, so the history page does not claim
+        # a facility was covered for a period it never was.
+        self.assertEqual((run.date_from, run.date_to),
+                         (date(2026, 9, 13), date(2026, 9, 20)))
+        self.assertFalse(run.is_backfill)
+
+    def test_a_facility_with_no_window_is_a_backfill_on_its_own(self):
+        never_uploaded = self._facility('Kilifi')
+        behind_a_day = self._facility('Malindi')
+        windows = {'Kilifi': None, 'Malindi': (date(2026, 9, 19), date(2026, 9, 20))}
+
+        run = services.create_run(
+            date(2026, 9, 20), date(2026, 9, 20), triggered_by='cron', mode='multi',
+            facilities=[never_uploaded, behind_a_day],
+            windows=lambda facility: windows[facility.name],
+        )
+
+        logs = {log.facility_label: log for log in run.logs.all()}
+        self.assertTrue(logs['Kilifi'].is_backfill)
+        self.assertFalse(logs['Malindi'].is_backfill)
+        # One container out of a hundred needing a full load is not the
+        # deployment's initial load, so the run-level flag stays off.
+        self.assertFalse(run.is_backfill)
+
+    def test_a_run_where_every_facility_needs_everything_is_a_backfill(self):
+        facilities = [self._facility('Kilifi'), self._facility('Malindi')]
+
+        run = services.create_run(
+            date(2026, 9, 20), date(2026, 9, 20), triggered_by='cron', mode='multi',
+            facilities=facilities, windows=lambda facility: None,
+        )
+
+        self.assertTrue(run.is_backfill)
+        self.assertEqual(run.period_label, 'All pending appointments')
+        self.assertTrue(all(log.is_backfill for log in run.logs.all()))
+
+    def test_without_windows_every_log_keeps_the_runs_own_dates(self):
+        # The nightly job and every manual upload go through this path unchanged.
+        facilities = [self._facility('Kilifi'), self._facility('Malindi')]
+
+        run = services.create_run(
+            date(2026, 1, 1), date(2026, 1, 2), triggered_by='manual',
+            mode='multi', facilities=facilities,
+        )
+
+        self.assertEqual((run.date_from, run.date_to), (date(2026, 1, 1), date(2026, 1, 2)))
+        for log in run.logs.all():
+            self.assertEqual((log.date_from, log.date_to),
+                             (date(2026, 1, 1), date(2026, 1, 2)))
+            self.assertFalse(log.is_backfill)
+
+    def test_the_worker_backfills_the_facility_its_log_says_to(self):
+        never_uploaded = self._facility('Kilifi')
+        behind_a_day = self._facility('Malindi')
+        windows = {'Kilifi': None, 'Malindi': (date(2026, 9, 19), date(2026, 9, 20))}
+        run = services.create_run(
+            date(2026, 9, 20), date(2026, 9, 20), triggered_by='cron', mode='multi',
+            facilities=[never_uploaded, behind_a_day],
+            windows=lambda facility: windows[facility.name],
+        )
+
+        @contextmanager
+        def fake_connect(config):
+            yield mock.Mock()
+
+        calls = {}
+
+        def fetch(conn, *dates):
+            calls[len(calls)] = dates
+            return []
+
+        with mock.patch.object(openmrs, 'connect', fake_connect), \
+                mock.patch.object(openmrs, 'fetch_appointments', side_effect=fetch), \
+                mock.patch.object(openmrs, 'fetch_patient_updates', return_value=[]):
+            services.execute_run(run, workers=1)
+
+        # Ordered by facility_label: Kilifi (no dates at all), then Malindi.
+        self.assertEqual(calls[0], ())
+        self.assertEqual(calls[1], (date(2026, 9, 19), date(2026, 9, 20)))
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key', OPENMRS_DB_LABEL='Env facility',
+                   UPLOAD_RETRY_BASE_MINUTES=30, UPLOAD_RETRY_MAX_MINUTES=120)
+class DueOnlyCommandTests(TestCase):
+    """The frequent tick: what it uploads, and when it does nothing at all."""
+
+    def setUp(self):
+        patcher = mock.patch('upload.services.execute_run', side_effect=self._succeed)
+        self.execute = patcher.start()
+        self.addCleanup(patcher.stop)
+        reachable = mock.patch('upload.services.platform_reachable',
+                               return_value=(True, ''))
+        self.reachable = reachable.start()
+        self.addCleanup(reachable.stop)
+
+    @staticmethod
+    def _succeed(run, workers=None):
+        UploadRun.objects.filter(pk=run.pk).update(status='success')
+        return run
+
+    def _tick(self, **kwargs):
+        out = StringIO()
+        call_command('upload_appointments', due_only=True, stdout=out, stderr=out, **kwargs)
+        return out.getvalue()
+
+    def _facility(self, name, **kwargs):
+        return Facility.objects.create(
+            name=name, host='h', username='u', password_encrypted='x', **kwargs,
+        )
+
+    def test_a_facility_already_uploaded_today_produces_no_run_at_all(self):
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'appointments_synced_through': timezone.localdate()},
+        )
+
+        output = self._tick()
+
+        self.assertIn('up to date', output)
+        self.assertFalse(UploadRun.objects.exists())
+        self.execute.assert_not_called()
+
+    def test_no_link_to_the_platform_leaves_no_trace(self):
+        # Forty-eight ticks through an afternoon with no internet must not write
+        # forty-eight failed runs; the facility is not behind, the link is down.
+        self.reachable.return_value = (False, 'Cannot reach api.test:443 — down.')
+
+        output = self._tick()
+
+        self.assertIn('No link to the platform', output)
+        self.assertFalse(UploadRun.objects.exists())
+
+    def test_a_tick_landing_inside_a_long_run_is_not_an_error(self):
+        # Cron mails anything that exits non-zero, and at this cadence overlapping
+        # a big run is routine rather than exceptional.
+        running = UploadRun.objects.create(
+            date_from=date(2026, 9, 20), date_to=date(2026, 9, 20),
+            mode='multi', triggered_by='cron', status='in_progress',
+            heartbeat_at=timezone.now(),
+        )
+
+        output = self._tick()
+
+        self.assertIn('still in progress', output)
+        self.assertEqual(UploadRun.objects.count(), 1)
+        self.assertEqual(UploadRun.objects.get().pk, running.pk)
+
+    def test_a_machine_switched_on_after_three_nights_off_uploads_those_nights(self):
+        today = timezone.localdate()
+        AppSettings.objects.update_or_create(
+            pk=1,
+            defaults={'appointments_synced_through': today - timedelta(days=3)},
+        )
+
+        self._tick()
+
+        run = UploadRun.objects.latest('pk')
+        self.assertEqual(run.mode, 'single')
+        self.assertEqual(run.date_from, today - timedelta(days=3))
+        self.assertEqual(run.date_to, today)
+        self.assertFalse(run.is_backfill)
+
+    def test_the_first_tick_on_a_fresh_install_is_a_backfill(self):
+        output = self._tick()
+
+        run = UploadRun.objects.latest('pk')
+        self.assertTrue(run.is_backfill)
+        self.assertIn('all pending', output)
+
+    def test_only_the_facilities_that_are_behind_are_uploaded(self):
+        today = timezone.localdate()
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'multi_facility_enabled': True},
+        )
+        self._facility('Kilifi', appointments_synced_through=today)
+        self._facility('Malindi', appointments_synced_through=today - timedelta(days=2))
+
+        self._tick()
+
+        run = UploadRun.objects.latest('pk')
+        self.assertEqual([log.facility_label for log in run.logs.all()], ['Malindi'])
+        self.assertEqual(run.facilities_total, 1)
+
+    def test_a_facility_still_inside_its_backoff_is_left_out(self):
+        today = timezone.localdate()
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'multi_facility_enabled': True},
+        )
+        self._facility(
+            'Kilifi',
+            appointments_synced_through=today - timedelta(days=1),
+            last_attempt_at=timezone.now() - timedelta(minutes=5),
+            consecutive_failures=2,
+        )
+
+        output = self._tick()
+
+        self.assertIn('up to date', output)
+        self.assertFalse(UploadRun.objects.exists())
+
+    def test_it_refuses_to_be_combined_with_a_date_range(self):
+        with self.assertRaises(CommandError) as ctx:
+            call_command('upload_appointments', due_only=True, date_from='2026-01-01')
+
+        self.assertIn('neither --backfill nor a date range', str(ctx.exception))
+        self.assertFalse(UploadRun.objects.exists())
+
+    def test_it_refuses_to_be_combined_with_backfill(self):
+        with self.assertRaises(CommandError):
+            call_command('upload_appointments', due_only=True, backfill=True)
+
+    def test_it_refuses_to_be_combined_with_a_single_facility(self):
+        facility = self._facility('Kilifi')
+
+        with self.assertRaises(CommandError) as ctx:
+            call_command('upload_appointments', due_only=True, facility=facility.pk)
+
+        self.assertIn('--facility on its own', str(ctx.exception))
+
+    def test_the_nightly_window_still_works_untouched(self):
+        # --due-only is an addition, not a replacement: a deployment that keeps
+        # its 6am cron entry must behave exactly as it did before.
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'initial_backfill_done': True},
+        )
+
+        call_command('upload_appointments')
+
+        run = UploadRun.objects.latest('pk')
+        self.assertEqual(run.date_from, date.today() - timedelta(days=1))
+        self.assertEqual(run.date_to, date.today())
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key')
+class WatermarkStampingTests(TestCase):
+    """What an upload does to the state the next tick reads."""
+
+    def _facility(self):
+        facility = Facility.objects.create(name='Kilifi', host='h', username='u')
+        facility.set_password('pw')
+        facility.save()
+        return facility
+
+    @contextmanager
+    def _openmrs(self, fails=False):
+        @contextmanager
+        def fake_connect(config):
+            yield mock.Mock()
+
+        fetch = mock.Mock(side_effect=RuntimeError('boom')) if fails \
+            else mock.Mock(return_value=[])
+        with mock.patch.object(openmrs, 'connect', fake_connect), \
+                mock.patch.object(openmrs, 'fetch_appointments', fetch), \
+                mock.patch.object(openmrs, 'fetch_patient_updates', return_value=[]):
+            yield
+
+    def _log(self, facility, date_from, date_to, is_backfill=False):
+        run = services.create_run(
+            date_from, date_to, triggered_by='cron', mode='multi',
+            facilities=[facility], is_backfill=is_backfill,
+        )
+        return run.logs.get()
+
+    def test_a_successful_upload_moves_the_watermark_to_its_end_date(self):
+        facility = self._facility()
+        log = self._log(facility, date(2026, 9, 19), date(2026, 9, 20))
+
+        with self._openmrs():
+            services.upload_facility(log, facility.as_config(), mock.Mock())
+
+        facility.refresh_from_db()
+        self.assertEqual(facility.appointments_synced_through, date(2026, 9, 20))
+        self.assertEqual(facility.consecutive_failures, 0)
+
+    def test_a_failed_upload_leaves_the_period_owed_for_next_time(self):
+        facility = self._facility()
+        Facility.objects.filter(pk=facility.pk).update(
+            appointments_synced_through=date(2026, 9, 17),
+        )
+        log = self._log(facility, date(2026, 9, 17), date(2026, 9, 20))
+
+        with self._openmrs(fails=True):
+            services.upload_facility(log, facility.as_config(), mock.Mock())
+
+        facility.refresh_from_db()
+        self.assertEqual(log.status, 'failed')
+        self.assertEqual(facility.appointments_synced_through, date(2026, 9, 17))
+        self.assertEqual(facility.consecutive_failures, 1)
+
+    def test_a_backfill_leaves_the_watermark_at_today(self):
+        # It covered everything outstanding, so only today's bookings are new.
+        facility = self._facility()
+        log = self._log(facility, date(2026, 9, 20), date(2026, 9, 20), is_backfill=True)
+
+        with self._openmrs():
+            services.upload_facility(log, facility.as_config(), mock.Mock(), backfill=True)
+
+        facility.refresh_from_db()
+        self.assertEqual(facility.appointments_synced_through, timezone.localdate())
+
+    def test_a_manual_upload_of_an_old_range_does_not_rewind_the_watermark(self):
+        facility = self._facility()
+        Facility.objects.filter(pk=facility.pk).update(
+            appointments_synced_through=date(2026, 9, 20),
+        )
+        log = self._log(facility, date(2026, 1, 1), date(2026, 1, 5))
+
+        with self._openmrs():
+            services.upload_facility(log, facility.as_config(), mock.Mock())
+
+        facility.refresh_from_db()
+        self.assertEqual(facility.appointments_synced_through, date(2026, 9, 20))
+
+    def test_a_facility_whose_password_cannot_be_read_still_counts_as_an_attempt(self):
+        # Otherwise it never leaves the due list and is retried every tick.
+        facility = Facility.objects.create(
+            name='Kilifi', host='h', username='u', password_encrypted='not-decryptable',
+        )
+        run = services.create_run(
+            date(2026, 9, 19), date(2026, 9, 20), triggered_by='cron',
+            mode='multi', facilities=[facility],
+        )
+
+        services.execute_run(run, workers=1)
+
+        facility.refresh_from_db()
+        self.assertEqual(facility.consecutive_failures, 1)
+        self.assertIsNotNone(facility.last_attempt_at)
+        self.assertIsNone(facility.appointments_synced_through)
+
+
+class RetryWindowTests(TestCase):
+    """Retrying a catch-up run gives each facility back its own period."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user('staff', password='pw', is_staff=True)
+        self.client = Client()
+
+    def _facility(self, name):
+        return Facility.objects.create(
+            name=name, host='h', username='u', password_encrypted='x',
+        )
+
+    @mock.patch('upload.services.spawn_run')
+    def test_a_retry_reuses_each_log_period_not_the_runs_envelope(self, mock_spawn):
+        never_uploaded = self._facility('Kilifi')
+        behind_a_day = self._facility('Malindi')
+        windows = {'Kilifi': None, 'Malindi': (date(2026, 9, 19), date(2026, 9, 20))}
+        run = services.create_run(
+            date(2026, 9, 20), date(2026, 9, 20), triggered_by='cron', mode='multi',
+            facilities=[never_uploaded, behind_a_day],
+            windows=lambda facility: windows[facility.name],
+        )
+        run.logs.update(status='failed')
+        UploadRun.objects.filter(pk=run.pk).update(status='failed', facilities_failed=2)
+
+        self.client.force_login(self.staff)
+        response = self.client.post(
+            reverse('upload:run_retry_failed', kwargs={'run_id': run.pk}),
+        )
+
+        retry = UploadRun.objects.get(pk=response.json()['run_id'])
+        logs = {log.facility_label: log for log in retry.logs.all()}
+        # The one that needed everything pending must not be handed a date range
+        # just because its neighbour only needed a day.
+        self.assertTrue(logs['Kilifi'].is_backfill)
+        self.assertFalse(logs['Malindi'].is_backfill)
+        self.assertEqual(logs['Malindi'].date_from, date(2026, 9, 19))
+        mock_spawn.assert_called_once()
+
+
+@override_settings(FIELD_ENCRYPTION_KEY='unit-test-key')
+class DueOnlyTenantTests(TestCase):
+    """The tick in multi-tenant mode, where the facility list is discovered."""
+
+    def setUp(self):
+        patcher = mock.patch('upload.services.execute_run', side_effect=self._succeed)
+        self.execute = patcher.start()
+        self.addCleanup(patcher.stop)
+        reachable = mock.patch('upload.services.platform_reachable',
+                               return_value=(True, ''))
+        reachable.start()
+        self.addCleanup(reachable.stop)
+        AppSettings.objects.update_or_create(
+            pk=1, defaults={'multi_tenant_enabled': True},
+        )
+
+    @staticmethod
+    def _succeed(run, workers=None):
+        UploadRun.objects.filter(pk=run.pk).update(status='success')
+        return run
+
+    def _tick(self, **kwargs):
+        out = StringIO()
+        call_command('upload_appointments', due_only=True, stdout=out, stderr=out, **kwargs)
+        return out.getvalue()
+
+    def _server(self):
+        server = TenantServer.objects.create(
+            name='Cloud', host='h', username='u', password_encrypted='x',
+        )
+        return server
+
+    def test_the_tick_refreshes_the_database_list_before_deciding(self):
+        server = self._server()
+        Facility.objects.create(
+            name='Kilifi', server=server, database_name='openmrs_kilifi',
+            host='h', username='u', password_encrypted='x',
+        )
+
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all',
+                        return_value=[(server, {'ok': True, 'message': 'synced'})]) as sync:
+            self._tick()
+
+        sync.assert_called_once()
+        self.assertEqual(sync.call_args[1]['reprobe'], False)
+        self.assertEqual(UploadRun.objects.latest('pk').mode, 'tenant')
+
+    def test_a_deployment_with_no_servers_declines_quietly_rather_than_failing(self):
+        # Raising here would mail the operator every half hour about a
+        # misconfiguration one message an hour would not fix any faster.
+        output = self._tick()
+
+        self.assertIn('no active tenant servers', output)
+        self.assertFalse(UploadRun.objects.exists())
+
+    def test_no_sync_skips_the_servers_and_uploads_what_is_known(self):
+        server = self._server()
+        Facility.objects.create(
+            name='Kilifi', server=server, database_name='openmrs_kilifi',
+            host='h', username='u', password_encrypted='x',
+        )
+
+        with mock.patch('upload.management.commands.upload_appointments.tenants.sync_all') as sync:
+            self._tick(no_sync=True)
+
+        sync.assert_not_called()
+        self.assertEqual(
+            [log.facility_label for log in UploadRun.objects.latest('pk').logs.all()],
+            ['Kilifi'],
+        )
+
+class CatchUpSeedMigrationTests(TransactionTestCase):
+    """0008 reads the watermarks out of the history a deployment already has.
+
+    Without this, the first tick on a deployment that has been uploading for
+    months would find every watermark empty, read that as "never uploaded", and
+    re-send every pending appointment for every facility.
+    """
+
+    migrate_from = ('upload', '0007_uploadlog_patient_updates_uploaded_and_more')
+    migrate_to = ('upload', '0008_appsettings_appointments_synced_through_and_more')
+
+    available_apps = ['upload', 'django.contrib.auth', 'django.contrib.contenttypes']
+
+    def _migrate(self, target):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate([target])
+        return executor
+
+    def setUp(self):
+        self._migrate(self.migrate_from)
+        self.old_apps = MigrationExecutor(connection).loader.project_state(
+            [self.migrate_from],
+        ).apps
+
+    def tearDown(self):
+        # Leave the database on the latest migration for whatever runs next.
+        self._migrate(self.migrate_to)
+
+    def _log(self, apps, **kwargs):
+        UploadLog = apps.get_model('upload', 'UploadLog')
+        defaults = dict(
+            date_from=date(2026, 9, 1), date_to=date(2026, 9, 1),
+            triggered_by='cron', status='success',
+        )
+        defaults.update(kwargs)
+        return UploadLog.objects.create(**defaults)
+
+    def test_a_facility_watermark_comes_from_its_latest_successful_upload(self):
+        old = self.old_apps
+        facility = old.get_model('upload', 'Facility').objects.create(
+            name='Kilifi', host='h', username='u', password_encrypted='x',
+        )
+        self._log(old, facility=facility, date_to=date(2026, 9, 18))
+        self._log(old, facility=facility, date_to=date(2026, 9, 20))
+        # A later failure says nothing about how far the facility actually got.
+        self._log(old, facility=facility, date_to=date(2026, 9, 21), status='failed')
+
+        self._migrate(self.migrate_to)
+
+        self.assertEqual(
+            Facility.objects.get(pk=facility.pk).appointments_synced_through,
+            date(2026, 9, 20),
+        )
+
+    def test_the_env_facility_watermark_comes_from_its_own_logs(self):
+        old = self.old_apps
+        old.get_model('upload', 'AppSettings').objects.create(pk=1)
+        # facility NULL is the environment-configured one, including for logs old
+        # enough to predate runs entirely.
+        self._log(old, facility=None, date_to=date(2026, 9, 19))
+
+        self._migrate(self.migrate_to)
+
+        self.assertEqual(AppSettings.objects.get(pk=1).appointments_synced_through,
+                         date(2026, 9, 19))
+
+    def test_a_facility_that_never_succeeded_is_left_needing_a_backfill(self):
+        old = self.old_apps
+        facility = old.get_model('upload', 'Facility').objects.create(
+            name='Kilifi', host='h', username='u', password_encrypted='x',
+        )
+        self._log(old, facility=facility, status='failed')
+
+        self._migrate(self.migrate_to)
+
+        self.assertIsNone(
+            Facility.objects.get(pk=facility.pk).appointments_synced_through,
+        )
+
+    def test_logs_of_a_backfill_run_are_marked_as_backfills_themselves(self):
+        old = self.old_apps
+        run = old.get_model('upload', 'UploadRun').objects.create(
+            date_from=date(2026, 9, 1), date_to=date(2026, 9, 1),
+            mode='single', triggered_by='cron', status='success', is_backfill=True,
+        )
+        log = self._log(old, run=run)
+
+        self._migrate(self.migrate_to)
+
+        self.assertTrue(UploadLog.objects.get(pk=log.pk).is_backfill)

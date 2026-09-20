@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import random
+import socket
 import subprocess
 import sys
 import threading
@@ -10,13 +11,14 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
+from urllib.parse import urlparse
 
 import requests
 from django.conf import settings
 from django.db.models import F, Q, Sum
 from django.utils import timezone
 
-from . import openmrs
+from . import openmrs, schedule
 from .models import AppSettings, Facility, UploadLog, UploadRun
 
 logger = logging.getLogger(__name__)
@@ -341,15 +343,31 @@ def upload_facility(log, config, tokens, backfill=False):
 
     log.finished_at = timezone.now()
     log.save(update_fields=['status', 'error_message', 'finished_at'])
+    # Move the catch-up watermark on, so the next tick asks for the right period
+    # and a facility that failed keeps owing what it owed. A backfill covered
+    # everything outstanding, so from here only today's bookings are new.
+    schedule.record_attempt(
+        log.facility_id,
+        ok=log.status == 'success',
+        synced_through=timezone.localdate() if backfill else log.date_to,
+    )
     return log
 
 
 def create_run(date_from, date_to, triggered_by, user=None, mode='single',
-               facilities=None, retry_of=None, is_backfill=False):
+               facilities=None, retry_of=None, is_backfill=False, windows=None):
     """Create an UploadRun and one pending UploadLog per target facility.
 
     Materialising the child logs up front is what makes the progress endpoint and
     "retry failed facilities" trivial: the runner just processes the rows it finds.
+
+    `windows` gives each facility a period of its own, which is what a catch-up
+    run needs: one container may be a day behind and the next a week, and one
+    nobody has ever uploaded needs no window at all but every pending
+    appointment. It is a callable taking a facility — or None for the
+    environment-configured one — and returning `(date_from, date_to)`, or None
+    to mean "everything pending". Without it every log takes the run's own
+    dates, which is what a manual upload and the nightly window both want.
     """
     if mode in UploadRun.MULTI_MODES:
         if facilities is None:
@@ -361,10 +379,35 @@ def create_run(date_from, date_to, triggered_by, user=None, mode='single',
     else:
         facilities = [None]
 
+    # Worked out before the run row exists, because the run's own dates are the
+    # envelope of its logs': a run whose worst-off facility is six days behind
+    # reads as six days, and the facility that is only a day behind still gets
+    # asked for a day.
+    periods = []
+    for facility in facilities:
+        window = windows(facility) if windows else None
+        if windows is None:
+            periods.append((facility, date_from, date_to, is_backfill))
+        elif window is None:
+            periods.append((facility, date_from, date_to, True))
+        else:
+            periods.append((facility, window[0], window[1], False))
+
+    if periods:
+        run_from = min(period[1] for period in periods)
+        run_to = max(period[2] for period in periods)
+        # A run is a backfill only when every facility in it is. The flag drives
+        # `period_label` and the deployment-wide initial-load record, and a run
+        # where one container out of a hundred needed a full load is not the
+        # initial load of the deployment.
+        run_backfill = all(period[3] for period in periods)
+    else:
+        run_from, run_to, run_backfill = date_from, date_to, is_backfill
+
     run = UploadRun.objects.create(
-        date_from=date_from,
-        date_to=date_to,
-        is_backfill=is_backfill,
+        date_from=run_from,
+        date_to=run_to,
+        is_backfill=run_backfill,
         mode=mode,
         triggered_by=triggered_by,
         triggered_by_user=user,
@@ -379,13 +422,14 @@ def create_run(date_from, date_to, triggered_by, user=None, mode='single',
             run=run,
             facility=facility,
             facility_label=facility.name if facility else env_label,
-            date_from=date_from,
-            date_to=date_to,
+            date_from=log_from,
+            date_to=log_to,
+            is_backfill=log_backfill,
             triggered_by=triggered_by,
             triggered_by_user=user,
             status='pending',
         )
-        for facility in facilities
+        for facility, log_from, log_to, log_backfill in periods
     ])
     return run
 
@@ -400,12 +444,12 @@ def _heartbeat_loop(run_pk, stop_event, interval=30):
         connections.close_all()
 
 
-def _facility_worker(log_pk, config, tokens, backfill=False):
+def _facility_worker(log_pk, config, tokens):
     """Run one facility in its own thread, closing that thread's DB connections."""
     from django.db import connections
     try:
         log = UploadLog.objects.get(pk=log_pk)
-        return upload_facility(log, config, tokens, backfill=backfill)
+        return upload_facility(log, config, tokens, backfill=log.is_backfill)
     finally:
         connections.close_all()
 
@@ -513,6 +557,9 @@ def execute_run(run, workers=None):
             log.error_message = str(exc)
             log.finished_at = timezone.now()
             log.save(update_fields=['status', 'error_message', 'finished_at'])
+            # An attempt that never got as far as connecting is still an attempt:
+            # without this the facility stays due and is retried every tick.
+            schedule.record_attempt(log.facility_id, ok=False)
             continue
         targets.append((log, config))
 
@@ -528,15 +575,14 @@ def execute_run(run, workers=None):
         try:
             if worker_count == 1:
                 for log, config in targets:
-                    upload_facility(log, config, tokens, backfill=run.is_backfill)
+                    upload_facility(log, config, tokens, backfill=log.is_backfill)
                     _record_facility_done(run.pk)
             else:
                 logger.info('Uploading %d facilities with %d workers.',
                             len(targets), worker_count)
                 with ThreadPoolExecutor(max_workers=worker_count) as pool:
                     futures = {
-                        pool.submit(_facility_worker, log.pk, config, tokens,
-                                    run.is_backfill): log
+                        pool.submit(_facility_worker, log.pk, config, tokens): log
                         for log, config in targets
                     }
                     for future in as_completed(futures):
@@ -552,6 +598,7 @@ def execute_run(run, workers=None):
                                 error_message=traceback.format_exc(),
                                 finished_at=timezone.now(),
                             )
+                            schedule.record_attempt(log.facility_id, ok=False)
                         _record_facility_done(run.pk)
         finally:
             stop_heartbeat.set()
@@ -604,6 +651,40 @@ def mark_stale_runs():
 def active_run():
     """The run currently in flight, if any. Callers should mark_stale_runs() first."""
     return UploadRun.objects.filter(status__in=UploadRun.ACTIVE_STATUSES).first()
+
+
+def platform_reachable(timeout=None):
+    """Whether the DIFF platform can be reached from here. Returns (ok, why).
+
+    A TCP connect, not a login. This runs every time the due-check ticks, and
+    what it needs to know is only whether there is a working link to the platform
+    at all — DNS resolves, a route exists, something is listening. Asking for a
+    token instead would put a failed login in the platform's own logs every half
+    hour of an outage, and spend the three retries and thirty-second timeouts in
+    `get_api_token` on a question a three-second socket answers.
+
+    The point is to keep a facility whose internet comes and goes from writing a
+    failed run every tick. With no link there is nothing to record but the
+    weather, and a history page of forty-eight identical connection errors is a
+    history page the operator stops reading.
+    """
+    url = settings.CHQI_API_BASE_URL
+    if not url:
+        return False, 'CHQI_API_BASE_URL is not configured.'
+
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return False, 'CHQI_API_BASE_URL is not a usable URL: {!r}.'.format(url)
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+    try:
+        socket.create_connection(
+            (parsed.hostname, port),
+            timeout=timeout or settings.UPLOAD_CONNECT_CHECK_SECONDS,
+        ).close()
+    except OSError as exc:
+        return False, 'Cannot reach {}:{} — {}.'.format(parsed.hostname, port, exc)
+    return True, ''
 
 
 def spawn_run(run_pk):
